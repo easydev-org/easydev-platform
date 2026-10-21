@@ -32,6 +32,7 @@ import (
 	"github.com/easydev-org/easydev-platform/internal/ci"
 	"github.com/easydev-org/easydev-platform/internal/gateway"
 	"github.com/easydev-org/easydev-platform/internal/ops"
+	"github.com/easydev-org/easydev-platform/internal/tenant"
 )
 
 func env(k, def string) string {
@@ -75,6 +76,11 @@ func main() {
 		}
 	}
 	vcs := server.New(cs, nil)
+	// P2: let the platform decide identity. easyvcs keeps its default token path
+	// whenever the resolver declines (anonymous / unknown user), so the
+	// standalone behaviour is preserved.
+	ident := &tenant.Resolver{CS: cs}
+	vcs.WithIdentity(ident.Identity)
 
 	// Ops engine: the tenant-safe registry + (optionally) the real k8s backend
 	// from easyops' library packages. Tenants share ONE k8s namespace

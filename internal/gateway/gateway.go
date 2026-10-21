@@ -27,6 +27,7 @@ import (
 
 	"github.com/easydev-org/easydev-platform/internal/ci"
 	"github.com/easydev-org/easydev-platform/internal/ops"
+	"github.com/easydev-org/easydev-platform/internal/tenant"
 )
 
 // Config wires the gateway.
@@ -113,36 +114,62 @@ func (g *Gateway) routes() {
 func (g *Gateway) platformAPI(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/api/v1/")
 	parts := strings.SplitN(rest, "/", 2) // [<ns>, "<segment>/..."]
-	tenant := parts[0]
+	ns := parts[0]
 	seg := ""
 	if len(parts) == 2 {
 		seg = parts[1]
 	}
 	switch {
-	case tenant == "":
+	case ns == "_":
+		// GLOBAL (non-tenant) endpoints live under /api/v1/_/ so a tenant named
+		// "users" or "whoami" can never shadow them (D1-S2). "_" is a reserved
+		// tenant name.
+		g.serveGlobal(w, r, seg)
+	case ns == "":
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "namespace is required"})
 	case strings.HasPrefix(seg, "ops"):
 		g.handleOps(w, r)
 	case strings.HasPrefix(seg, "ci"):
-		g.handleCITenant(w, r, tenant, strings.TrimPrefix(strings.TrimPrefix(seg, "ci"), "/"))
+		g.handleCITenant(w, r, ns, strings.TrimPrefix(strings.TrimPrefix(seg, "ci"), "/"))
 	default:
 		// VCS: rewrite /api/v1/<ns>/<rest> -> /api/v1/namespaces/<ns>/<rest>.
-		g.serveVCS(w, r, tenant, seg)
+		g.serveVCS(w, r, ns, seg)
 	}
 }
 
-// serveVCS rewrites the platform path to the easyvcs path shape and hands the
-// request to the embedded easyvcs router.
-func (g *Gateway) serveVCS(w http.ResponseWriter, r *http.Request, tenant, seg string) {
+// serveGlobal serves the NON-tenant endpoints under /api/v1/_/.
+//
+// They are easyvcs' own global handlers (users, tokens, whoami, namespaces), so
+// we rewrite /api/v1/_/<rest> -> /api/v1/<rest> and let the embedded server
+// answer. The leading "_" is a reserved tenant name.
+func (g *Gateway) serveGlobal(w http.ResponseWriter, r *http.Request, seg string) {
 	if g.cfg.VCS == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "vcs is not configured"})
 		return
 	}
 	r2 := r.Clone(r.Context())
-	r2.URL.Path = "/api/v1/namespaces/" + tenant
+	r2.URL.Path = "/api/v1/"
+	if seg != "" {
+		r2.URL.Path += seg
+	}
+	g.cfg.VCS.Router().ServeHTTP(w, r2)
+}
+
+// serveVCS rewrites the platform path to the easyvcs path shape and hands the
+// request to the embedded easyvcs router.
+func (g *Gateway) serveVCS(w http.ResponseWriter, r *http.Request, ns, seg string) {
+	if g.cfg.VCS == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "vcs is not configured"})
+		return
+	}
+	r2 := r.Clone(r.Context())
+	r2.URL.Path = "/api/v1/namespaces/" + ns
 	if seg != "" {
 		r2.URL.Path += "/" + seg
 	}
+	// Tell the identity resolver which tenant this is (the path is now easyvcs'
+	// own shape). Always overwrite: a client-supplied value must never survive.
+	r2.Header.Set(tenant.TenantHeader, ns)
 	g.cfg.VCS.Router().ServeHTTP(w, r2)
 }
 
