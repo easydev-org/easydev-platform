@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: easyops
+  namespace: easydev
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: easyops }
+  template:
+    metadata:
+      labels: { app: easyops }
+    spec:
+      serviceAccountName: easyops
+      containers:
+        - name: easyops
+          image: artifact.worker.svc.cluster.local/easyops/easyops:latest
+          ports: [{ containerPort: 8080, name: http }]
+          env:
+            - { name: PORT, value: "8080" }
+            # The tenant namespace where sandboxes/services/jobs are created.
+            - { name: SANDBOX_NAMESPACE, value: "easydev" }
+            - name: EASYOPS_SERVICE_TOKEN
+              valueFrom: { secretKeyRef: { name: easydev-secrets, key: EASYVCS_SERVICE_TOKEN } }
+            # Verify user tokens against easyvcs (unified identity).
+            - { name: EASYOPS_EASYVCS_URL, value: "http://easyvcs" }
+            # Image builds push to the easyblobs OCI registry.
+            - { name: IMAGE_REGISTRY_HOST, value: "easyblobs.easydev.svc.cluster.local" }
+            - { name: IMAGE_REGISTRY_SCHEME, value: "http" }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: easyops
+  namespace: easydev
+spec:
+  selector: { app: easyops }
+  ports:
+    - { port: 80, targetPort: 8080, name: http }

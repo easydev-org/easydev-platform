@@ -1,0 +1,18 @@
+# ONE origin: /ui, /api/v1, /blobs, /ops, /ci all hit the platform.
+# k3s ships Traefik, so this is a standard Ingress.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: easydev
+  namespace: easydev
+spec:
+  rules:
+    - host: easydev.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: easydev-platform
+                port: { number: 80 }

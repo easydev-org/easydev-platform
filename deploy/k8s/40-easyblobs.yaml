@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: easyblobs
+  namespace: easydev
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: easyblobs }
+  template:
+    metadata:
+      labels: { app: easyblobs }
+    spec:
+      containers:
+        - name: easyblobs
+          image: artifact.worker.svc.cluster.local/easyblobs/easyblobs:latest
+          args: ["--listen", ":8080", "--data", "/data"]
+          ports: [{ containerPort: 8080, name: http }]
+          envFrom:
+            - secretRef: { name: easydev-secrets }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 3
+          volumeMounts:
+            - { name: data, mountPath: /data }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+      volumes:
+        # Only needed when S3 is NOT configured; with EASYBLOBS_S3_* set the CAS
+        # lives in the bucket and this PVC holds just the local cache.
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: easyblobs
+  namespace: easydev
+spec:
+  selector: { app: easyblobs }
+  ports:
+    - { port: 80, targetPort: 8080, name: http }

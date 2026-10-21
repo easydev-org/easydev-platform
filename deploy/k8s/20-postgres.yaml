@@ -1,0 +1,57 @@
+# A single-instance Postgres for a small k3s deployment. For production use a
+# managed Postgres and delete this file.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secret
+  namespace: easydev
+type: Opaque
+stringData:
+  POSTGRES_DB: easydev
+  POSTGRES_USER: easydev
+  POSTGRES_PASSWORD: change-me
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: easydev
+spec:
+  selector: { app: postgres }
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: easydev
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          ports: [{ containerPort: 5432 }]
+          envFrom:
+            - secretRef: { name: postgres-secret }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "easydev"] }
+            initialDelaySeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 10Gi } }

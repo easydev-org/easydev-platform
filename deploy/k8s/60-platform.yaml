@@ -1,0 +1,44 @@
+# The platform: ONE origin (gateway) + the CI orchestrator. It EMBEDS easyvcs
+# (library) and PROXIES easyblobs and easyops.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: easydev-platform
+  namespace: easydev
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: easydev-platform }
+  template:
+    metadata:
+      labels: { app: easydev-platform }
+    spec:
+      containers:
+        - name: platform
+          image: artifact.worker.svc.cluster.local/easydev/easydev-platform:latest
+          args: ["--listen", ":8080"]
+          ports: [{ containerPort: 8080, name: http }]
+          envFrom:
+            - secretRef: { name: easydev-secrets }
+          env:
+            # Point the proxies at the sibling Services. Leave either empty to
+            # run WITHOUT that component (its prefix then 502s).
+            - { name: EASYDEV_BLOBS_URL, value: "http://easyblobs" }
+            - { name: EASYDEV_OPS_URL, value: "http://easyops" }
+            - { name: EASYDEV_CI_OPS, value: "easyops" }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 3
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: easydev-platform
+  namespace: easydev
+spec:
+  selector: { app: easydev-platform }
+  ports:
+    - { port: 80, targetPort: 8080, name: http }

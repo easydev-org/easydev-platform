@@ -1,0 +1,41 @@
+# easyops is the ONLY component that needs Kubernetes permissions. It creates
+# Pods/Services/Secrets (sandboxes), Deployments/Services (services), Jobs
+# (CI jobs), PVCs, and reads Pod logs + Events for diagnostics.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: easyops
+  namespace: easydev
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: easyops
+  namespace: easydev
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "secrets", "configmaps", "persistentvolumeclaims", "events"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: easyops
+  namespace: easydev
+subjects:
+  - kind: ServiceAccount
+    name: easyops
+    namespace: easydev
+roleRef:
+  kind: Role
+  name: easyops
+  apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,16 @@
+// The easydev-platform workspace. During platform development the three core
+// servers are checked out as SIBLINGS and wired here, so a change in any of
+// them is picked up immediately without publishing a version. For a standalone
+// build (Dockerfile, CI) these `use` lines are ABSENT and the modules come from
+// the proxy — see go.mod.
+//
+// Layout expected by this file:
+//   ../easyvcs   ../easyblobs   ../easyops   ../easydev-platform
+
+go 1.27.2
+
+use (
+	.
+	../easyvcs
+	../easyops
+)
