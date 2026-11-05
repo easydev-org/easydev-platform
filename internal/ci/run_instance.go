@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/easydev-org/easydev-platform/internal/ci/expr"
 )
@@ -20,6 +22,14 @@ import (
 func (o *Orchestrator) runInstance(ctx context.Context, run *Run, inst *Instance, wf *Workflow, results map[string]*JobResult, ops OpsClient) instanceResult {
 	j := inst.Job
 	vars := o.baseVars(run, inst, wf, results)
+
+	// Secrets are resolved ONCE per run into a per-run Secret object; the job spec
+	// carries only REFERENCES into it, so a value never enters the script, the
+	// spec, or this process's long-lived state.
+	secretRefs, secretCtx := run.secretRefs, run.secretCtx
+	if secretCtx != nil {
+		vars["secrets"] = secretCtx
+	}
 
 	// `if:` on the JOB is evaluated here: no step has run yet, so there is no
 	// runtime state to consider.
@@ -85,28 +95,91 @@ func (o *Orchestrator) runInstance(ctx context.Context, run *Run, inst *Instance
 		// ONE executor job per instance. The name carries the instance key and a
 		// per-run counter so it is unique AND short enough not to be truncated
 		// into a collision (which is what used to happen with one job per step).
-		Name:           o.executorName(run, inst),
-		Namespace:      run.Namespace,
-		Owner:          run.Owner,
-		Image:          imageFor(inst.Job),
-		Commands:       []string{script},
+		Name:      o.executorName(run, inst),
+		Namespace: run.Namespace,
+		Owner:     run.Owner,
+		Image:     imageFor(inst.Job),
+		Commands:  []string{script},
+		// Secrets are NEVER in Env: only refs, so the value cannot leak into the
+		// spec. (The orchestrator keeps `secretEnv` solely to create the per-run
+		// Secret the reference points at.)
 		Env:            baseEnv,
+		SecretEnv:      secretRefs,
 		Shell:          "bash",
 		TimeoutSeconds: jobTimeoutSeconds(inst.Job),
 		Checkout:       nil, // the script performs the checkout itself
 		Services:       serviceSpecs(inst.Job),
 	}
 
-	jobID, err := ops.RunJob(ctx, spec)
+	// The job runs under a context this orchestrator owns, so a CANCELLATION can
+	// interrupt it: canceling the context stops WaitJob, and DeleteJob then kills
+	// the container. Waiting only at step boundaries (the old behaviour) meant a
+	// 30-minute job ignored a cancel for 30 minutes.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	if o.canceled(ctx, run.ID) {
+		return instanceResult{state: RunCanceled}
+	}
+	// Watch for a cancellation request in the background and cancel the job.
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopWatch:
+				return
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				if o.canceled(context.Background(), run.ID) {
+					cancelRun()
+					return
+				}
+			}
+		}
+	}()
+
+	jobID, err := ops.RunJob(runCtx, spec)
 	if err != nil {
 		return instanceResult{state: RunFailed, err: err.Error()}
 	}
-	code, werr := ops.WaitJob(ctx, jobID)
-	logs, _ := ops.Logs(ctx, jobID)
-	_ = ops.DeleteJob(ctx, jobID)
+
+	// Stream the log when the backend supports it, so a long step shows progress
+	// live instead of surfacing only after it ends.
+	var streamMu sync.Mutex
+	var streamed strings.Builder
+	streamDone := make(chan struct{})
+	if ls, ok := ops.(LogStreamer); ok {
+		go func() {
+			defer close(streamDone)
+			_ = ls.WatchLogs(runCtx, jobID, func(chunk string) {
+				streamMu.Lock()
+				streamed.WriteString(chunk)
+				streamMu.Unlock()
+				o.emitLog(run.ID, inst.Key, chunk)
+			})
+		}()
+	} else {
+		close(streamDone)
+	}
+
+	code, werr := ops.WaitJob(runCtx, jobID)
+	// Killing the job is what makes a cancellation real; it is also the normal
+	// cleanup path.
+	_ = ops.DeleteJob(context.Background(), jobID)
+	<-streamDone
+	logs, _ := ops.Logs(context.Background(), jobID)
+	streamMu.Lock()
+	streamedLog := streamed.String()
+	streamMu.Unlock()
+	if logs == "" {
+		logs = streamedLog
+	}
 
 	out := instanceResult{exit: code}
-	if werr != nil && strings.Contains(werr.Error(), "cancel") {
+	if runCtx.Err() != nil || (werr != nil && strings.Contains(werr.Error(), "cancel")) {
 		out.state = RunCanceled
 		return out
 	}

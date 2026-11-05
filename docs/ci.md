@@ -284,7 +284,56 @@ about CI.
 
 `?allow_ungated=true` is the documented escape hatch for an operator override.
 
-## 7. Deliberate non-goals
+## 7. Secrets and permissions
+
+Both use the same rule: **a credential is never interpolated; it is referenced.**
+
+### Secrets
+
+```yaml
+jobs:
+  deploy:
+    env:
+      TOKEN: ${{ secrets.deploy }}
+    steps:
+      - run: ./deploy --token "$TOKEN"
+```
+
+- `${{ secrets.deploy }}` resolves to a shell variable reference
+  (`$EASYDEV_SECRET_DEPLOY_TOKEN`), not to the value.
+- The value is written to a **per-run Secret** (`ci-<run-id>`), removed when the
+  run ends, and injected by the kubelet through a `secretKeyRef`.
+- A reference to a secret the tenant does not have **fails the run** at plan
+  time: silently substituting `""` would deploy with an empty credential.
+
+### Permissions
+
+```yaml
+permissions:
+  contents: read     # the VCS: read the snapshot
+  packages: write    # the package registry
+```
+
+- The default is **none**: an undeclared workflow gets no credential.
+- `contents: read` mints a read-only VCS token; `contents: write` mints a write
+  token and exposes both `EASYDEV_VCS_TOKEN` and `EASYDEV_VCS_WRITE_TOKEN`.
+- An unknown scope (e.g. `security-events`) or an invalid level is a hard error,
+  and a requested scope the platform cannot grant **fails the run** instead of
+  running with less than the workflow believes it has.
+- Tokens are minted per run from the VCS store (one token authority), so one
+  run's credential can be revoked without touching another's.
+
+## 8. Cancellation and live logs
+
+- **Cancel interrupts a running job.** The orchestrator owns the job's context, a
+  watcher cancels it on a cancellation request, and the executor job is DELETED —
+  which is what actually kills the container. (Cancelling only at step boundaries
+  meant a 30-minute job ignored a cancel for 30 minutes.)
+- **Live logs**: `GET /api/v1/{ns}/ci/runs/{id}/logs/{instanceKey}` streams
+  chunks as the job produces them and closes when the run is terminal. Without
+  it, a long step was silent until it finished.
+
+## 9. Deliberate non-goals
 
 | Not doing | Why |
 |---|---|
@@ -312,6 +361,11 @@ Implemented and covered by tests (`internal/ci`, `internal/wf`,
 | cancel, re-run (re-pinned), workflow listing | done |
 | durable state (`ci.SQLStore`: sqlite/pg/mysql, pure-Go driver) | done |
 | `concurrency:` group + cancel-in-progress (cross-replica) | done |
+| `strategy.max-parallel` / `fail-fast` honoured | done |
+| cancellation interrupts a RUNNING job (not just between steps) | done |
+| live log streaming (`GET .../runs/{id}/logs/{instance}`) | done |
+| `secrets:` as Secret REFERENCES (value never in the spec) | done |
+| `permissions:` enforced as a scoped, short-lived token | done |
 | `Untrusted` job hardening (no SA token, non-root, RO rootfs, no caps) | done |
 | end-to-end test: VCS snapshot → workflow → run → check | done |
 

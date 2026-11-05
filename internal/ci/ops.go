@@ -8,34 +8,102 @@ import (
 	"sync"
 )
 
-// OpsClient is the slice of the execution backend the orchestrator needs. It is
-// an interface (not the generated Connect client) so the orchestrator is
-// testable without a cluster, and so several backends can stand in:
+// OpsClient is the slice of the execution backend the orchestrator needs.
 //
-//   - EngineOps   — in-process easyops library packages (k8s Jobs)
-//   - ConnectOps  — easyops.v1.OpsService over Connect (the production path)
-//   - RunnerOps   — a self-hosted runner pool (cluster-external execution)
-//   - FakeOps     — in-process, for tests and dry runs
-//
-// Every step is submitted as one run-to-completion job; the orchestrator never
-// blocks on RunJob (it polls WaitJob), so a long job cannot pin a goroutine to a
-// request context.
+// Every JOB INSTANCE is one run-to-completion job (all of its steps run inside
+// it, see supervisor.go); RunJob must NOT block.
 type OpsClient interface {
-	// RunJob starts a job and returns an identifier. It must NOT block until
-	// completion.
+	// RunJob starts a job and returns an identifier.
 	RunJob(ctx context.Context, spec JobSpec) (jobID string, err error)
-	// WaitJob blocks until the job reaches a terminal state and returns its
-	// exit code (0 = success).
+	// WaitJob blocks until the job reaches a terminal state and returns its exit
+	// code (0 = success). It MUST return promptly when ctx is canceled, so a
+	// cancelled run stops waiting; the caller then calls DeleteJob to kill it.
 	WaitJob(ctx context.Context, jobID string) (exitCode int, err error)
-	// Logs returns the job's log tail.
+	// Logs returns the job's full (or tail) log.
 	Logs(ctx context.Context, jobID string) (string, error)
-	// DeleteJob removes the job (best-effort cleanup).
+	// DeleteJob removes the job, which is how a cancellation actually STOPS it.
 	DeleteJob(ctx context.Context, jobID string) error
 }
 
-// CheckoutSpec tells the executor to materialise a source tree before the step
-// script runs. The platform NEVER clones git: it fetches easyvcs' subtree
-// archive, so the checkout is the same pinned snapshot the workflow came from.
+// LogStreamer is implemented by backends that can STREAM a running job's log.
+//
+// It is a separate interface (not part of OpsClient) so a backend can be useful
+// without it: a run still works on the poll-the-tail path, it just cannot show
+// progress live. easyops has WatchJobLogs, so the production path implements it.
+type LogStreamer interface {
+	// WatchLogs calls emit for each new chunk until the job ends or ctx is
+	// canceled. emit must be called from at most one goroutine at a time.
+	WatchLogs(ctx context.Context, jobID string, emit func(chunk string)) error
+}
+
+// SecretResolver is implemented by backends that can read a tenant secret.
+//
+// Secrets are resolved as KEY REFERENCES by the executor where possible (a k8s
+// secretKeyRef, so the value never enters the Job spec); this interface exists
+// for backends without that primitive and for dry runs, and it is used ONLY when
+// the backend does not support references.
+type SecretResolver interface {
+	// Secret returns the secret's key/value pairs.
+	Secret(ctx context.Context, owner, name string) (map[string]string, error)
+}
+
+// JobSpec is one job instance (all of its steps) to run.
+type JobSpec struct {
+	// Name is unique within a namespace (the orchestrator makes it so).
+	Name      string
+	Namespace string
+	Owner     string
+
+	Image string
+	// Commands is the single script that runs every step. Exactly one entry is
+	// used: the supervisor script.
+	Commands []string
+	// Shell selects the interpreter (bash | sh | pwsh).
+	Shell string
+	// WorkDir is where the script starts (default /workspace).
+	WorkDir string
+
+	Env map[string]string
+	// SecretEnv are environment variables sourced from a SECRET REFERENCE rather
+	// than a literal, so the value never appears in the Job spec or in a log.
+	SecretEnv []SecretEnvVar
+	// Secrets are resolved values from a SecretResolver (backends without
+	// references). Empty for the k8s path.
+	Secrets map[string]string
+
+	CPU            string
+	Memory         string
+	TimeoutSeconds int
+
+	// Checkout, when non-nil, makes the EXECUTOR materialise a source tree
+	// before the script runs. The orchestrator leaves it nil (its supervisor
+	// script fetches the tree itself, once per job).
+	Checkout *CheckoutSpec
+	// Services are companion containers started alongside the job.
+	Services map[string]ServiceSpec
+
+	// RunnerLabels selects a runner pool (k8s: node selector / tolerations).
+	RunnerLabels []string
+
+	// Workspace is a PVC claim mounted at /workspace (cache reuse).
+	Workspace string
+}
+
+// SecretEnvVar binds an environment variable to a key of an existing secret.
+//
+// The reference is rendered as a k8s secretKeyRef, so the VALUE never travels
+// through this struct, the Job spec, or the orchestrator's memory.
+type SecretEnvVar struct {
+	// Env is the variable name exposed to the script.
+	Env string
+	// Secret is the secret object's name.
+	Secret string
+	// Key is the key inside the secret.
+	Key string
+}
+
+// CheckoutSpec tells the executor to materialise a source tree before the
+// script runs.
 type CheckoutSpec struct {
 	// Ref is a snapshot sha, branch, tag or revision id.
 	Ref string
@@ -48,7 +116,7 @@ type CheckoutSpec struct {
 	URL string
 }
 
-// ServiceSpec is a companion container started next to the step.
+// ServiceSpec is a companion container started next to the job.
 type ServiceSpec struct {
 	Image   string
 	Env     map[string]string
@@ -57,47 +125,7 @@ type ServiceSpec struct {
 	Args    []string
 }
 
-// JobSpec is one job to run on the backend, already resolved by the
-// orchestrator. It is derived from ONE workflow step.
-type JobSpec struct {
-	// Name is unique within a namespace (the orchestrator makes it so).
-	Name      string
-	Namespace string
-	Owner     string
-
-	Image string
-	// Commands is the shell script. Exactly one entry is used by the k8s
-	// backend (it becomes `/bin/sh -c "<script>"`); the runner backend may run
-	// them one by one.
-	Commands []string
-	// Shell selects the interpreter: bash | sh | pwsh (default bash).
-	Shell string
-	// WorkDir is where the script runs (default /workspace).
-	WorkDir string
-
-	Env map[string]string
-
-	CPU    string
-	Memory string
-	// TimeoutSeconds bounds the job (0 = no deadline).
-	TimeoutSeconds int
-
-	// Checkout, when non-nil, materialises a source tree before the script.
-	Checkout *CheckoutSpec
-	// Services, when non-empty, are started alongside the job.
-	Services map[string]ServiceSpec
-
-	// RunnerLabels selects a runner pool (k8s: node selector / tolerations).
-	RunnerLabels []string
-
-	// Workspace is a PVC claim mounted at /workspace (cache reuse). Empty = an
-	// ephemeral emptyDir.
-	Workspace string
-}
-
-// Script flattens a job's commands into ONE shell script (used by the k8s
-// backend, where a step is one container). `set -e` makes a failing command stop
-// the script, which is what `run:` blocks rely on.
+// Script flattens commands into ONE shell script.
 func Script(cmds []string) (command []string, args []string) {
 	var b strings.Builder
 	b.WriteString("set -e\n")
@@ -114,8 +142,7 @@ func Drain(r io.Reader, max int) string {
 	return string(b)
 }
 
-// FakeOps is an in-process OpsClient for tests and for `--ci-dry-run`. It
-// "runs" a job by recording it and returning a configurable result.
+// FakeOps is an in-process OpsClient for tests and for `--ci-dry-run`.
 type FakeOps struct {
 	mu   sync.Mutex
 	jobs map[string]JobSpec
@@ -126,6 +153,10 @@ type FakeOps struct {
 	FailJob func(spec JobSpec) int
 	// LogFor, when non-nil, supplies the captured log.
 	LogFor func(spec JobSpec) string
+	// Stream makes WatchLogs available (chunked delivery of LogFor's output).
+	Stream bool
+	// Canceled records job ids that were deleted before finishing.
+	Canceled []string
 	// Calls records the specs in submission order (assertions in tests).
 	Calls []JobSpec
 }
@@ -159,10 +190,17 @@ func (f *FakeOps) RunJob(ctx context.Context, spec JobSpec) (string, error) {
 // WaitJob returns the recorded exit code.
 func (f *FakeOps) WaitJob(ctx context.Context, jobID string) (int, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	code, ok := f.exit[jobID]
+	f.mu.Unlock()
 	if !ok {
 		return 0, fmt.Errorf("ci: unknown job %q", jobID)
+	}
+	// Honour cancellation, like the real backend: a canceled wait must return
+	// promptly so the orchestrator can delete the job.
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	default:
 	}
 	return code, nil
 }
@@ -174,8 +212,38 @@ func (f *FakeOps) Logs(ctx context.Context, jobID string) (string, error) {
 	return f.logs[jobID], nil
 }
 
-// DeleteJob is a no-op.
-func (f *FakeOps) DeleteJob(ctx context.Context, jobID string) error { return nil }
+// DeleteJob records a cancellation and removes the job.
+func (f *FakeOps) DeleteJob(ctx context.Context, jobID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.jobs[jobID]; ok {
+		f.Canceled = append(f.Canceled, jobID)
+		delete(f.jobs, jobID)
+	}
+	return nil
+}
+
+// WatchLogs streams the recorded log in two chunks (when Stream is set), so the
+// streaming path can be tested without a cluster.
+func (f *FakeOps) WatchLogs(ctx context.Context, jobID string, emit func(string)) error {
+	f.mu.Lock()
+	log := f.logs[jobID]
+	f.mu.Unlock()
+	if !f.Stream {
+		return fmt.Errorf("ci: mock: streaming is not enabled (set FakeOps.Stream)")
+	}
+	if len(log) > 0 {
+		mid := len(log) / 2
+		emit(log[:mid])
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		emit(log[mid:])
+	}
+	return nil
+}
 
 // Specs returns the recorded specs (copy), for assertions.
 func (f *FakeOps) Specs() []JobSpec {

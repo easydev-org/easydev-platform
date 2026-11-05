@@ -3,6 +3,7 @@ package ci
 import (
 	"context"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -111,6 +112,42 @@ type Orchestrator struct {
 	vcsBase  string
 	vcsUser  string
 	vcsToken string
+	// logMu guards logSubs (live log subscribers, one per run instance).
+	logMu   sync.Mutex
+	logSubs map[string]chan string
+	// onLog, when set, observes every forwarded log chunk (tests, and a future
+	// websocket fan-out). Normal subscribers go through SubscribeLogs.
+	onLog func(runID, instanceKey, chunk string)
+	// tokens mints the scoped credential `permissions:` grants. nil = a workflow
+	// that requests access fails at plan time.
+	tokens TokenMinter
+	// secrets resolves a tenant's stored secrets. nil = secrets are disabled.
+	secrets SecretsProvider
+	// secretWriter persists the per-run Secret the jobs reference. nil = the
+	// backend resolves references itself (nothing to create).
+	secretWriter SecretWriter
+}
+
+// WithSecrets enables `${{ secrets.X }}`. Both a provider (to read the values)
+// and a writer (to create the per-run Secret the jobs reference) are needed: the
+// value must reach the kubelet, not the Job spec.
+func (o *Orchestrator) WithSecrets(p SecretsProvider, w SecretWriter) *Orchestrator {
+	o.secrets, o.secretWriter = p, w
+	return o
+}
+
+// WithTokenMinter enables `permissions:` enforcement.
+func (o *Orchestrator) WithTokenMinter(m TokenMinter) *Orchestrator {
+	o.tokens = m
+	return o
+}
+
+// SecretWriter persists the ephemeral Secret a run's jobs reference.
+type SecretWriter interface {
+	// PutRunSecret creates or replaces the run's Secret with the given values.
+	PutRunSecret(ctx context.Context, tenant, name string, values map[string]string) error
+	// DeleteRunSecret removes it after the run.
+	DeleteRunSecret(ctx context.Context, tenant, name string) error
 }
 
 // WithVCS configures how the in-container supervisor fetches the source tree.
@@ -179,6 +216,7 @@ func (o *Orchestrator) Run(ctx context.Context, ev Event) (string, error) {
 	}
 
 	now := o.now().UTC().UnixMilli()
+
 	run := &Run{
 		ID:           o.newRunID(now, ev.Namespace, firstNonEmpty(ev.Ref, ev.Tag, "manual")),
 		Namespace:    ev.Namespace,
@@ -214,6 +252,41 @@ func (o *Orchestrator) Run(ctx context.Context, ev Event) (string, error) {
 			run.Steps += len(inst.Job.Steps)
 		}
 	}
+	// Secrets are resolved BEFORE the run exists: a workflow that references a
+	// secret the tenant does not have must fail here, never start a deploy with an
+	// empty credential.
+	secretEnv, secretRefs, secretCtx, serr := o.resolveSecrets(ctx, run, wf)
+	if serr != nil {
+		return "", serr
+	}
+	// `permissions:` decides which credential the job gets; a request the platform
+	// cannot satisfy fails here for the same reason.
+	permEnv, perr := o.resolvePermissions(ctx, run, wf)
+	if perr != nil {
+		return "", perr
+	}
+	// Permission tokens join the same per-run secret, so they are referenced
+	// rather than written into the job spec.
+	for k, v := range permEnv {
+		if secretEnv == nil {
+			secretEnv = map[string]string{}
+		}
+		secretEnv[k] = v
+		secretRefs = append(secretRefs, SecretEnvVar{
+			Env: k, Secret: runSecretName(run), Key: sanitize(k),
+		})
+	}
+	if len(secretEnv) > 0 {
+		if o.secretWriter != nil {
+			// The values must reach the kubelet as a SECRET, not the Job spec.
+			if werr := o.secretWriter.PutRunSecret(ctx, ev.Namespace, runSecretName(run), secretEnv); werr != nil {
+				return "", fmt.Errorf("ci: store run secrets: %w", werr)
+			}
+			run.secretOwned = true
+		}
+		run.secrets, run.secretRefs, run.secretCtx = secretEnv, secretRefs, secretCtx
+	}
+
 	if err := o.store.PutRun(ctx, run); err != nil {
 		return "", err
 	}
@@ -240,7 +313,9 @@ func (o *Orchestrator) execute(ctx context.Context, run *Run, plan *Plan, ops Op
 			}
 			continue
 		}
-		sem := make(chan struct{}, maxInt(o.MaxParallel, 1))
+		// The stage's concurrency is the SMALLEST `max-parallel` any instance in
+		// it declares (the workflow's own limit wins over the server default).
+		sem := make(chan struct{}, stageParallelism(stage, o.MaxParallel))
 		var wg sync.WaitGroup
 		var mu sync.Mutex
 		for _, inst := range stage {
@@ -254,8 +329,23 @@ func (o *Orchestrator) execute(ctx context.Context, run *Run, plan *Plan, ops Op
 			wg.Add(1)
 			go func(inst *Instance) {
 				defer wg.Done()
+				// Acquire a slot FIRST, then re-check: the abort flag can only
+				// change while another instance holds/was holding a slot, so
+				// checking before the semaphore would race with the failure that
+				// sets it (and could stop an instance that should have run).
 				sem <- struct{}{}
 				defer func() { <-sem }()
+
+				// fail-fast: once a sibling has failed, do not START the rest.
+				mu.Lock()
+				abort := failed && failFast(stage)
+				mu.Unlock()
+				if abort {
+					if r, ok := byKey[inst.Key]; ok && r.State == RunPending {
+						r.State = RunCanceled
+					}
+					return
+				}
 
 				started := o.now().UTC().UnixMilli()
 				res := o.runInstance(ctx, run, inst, wf, byKey, ops)
@@ -286,6 +376,13 @@ func (o *Orchestrator) execute(ctx context.Context, run *Run, plan *Plan, ops Op
 	details := "all jobs succeeded"
 	if failed {
 		details = "one or more jobs failed"
+	}
+	// The per-run Secret holds the tenant's credentials for exactly as long as
+	// the run: remove it now that nothing can reference it.
+	if run.secretOwned && o.secretWriter != nil {
+		if derr := o.secretWriter.DeleteRunSecret(context.Background(), run.Namespace, runSecretName(run)); derr != nil {
+			log.Printf("ci: delete run secret %s: %v", runSecretName(run), derr)
+		}
 	}
 	failing := ""
 	for _, j := range run.Jobs {
@@ -569,4 +666,87 @@ func SortedJobKeys(r *Run) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// emitLog publishes a live log chunk.
+//
+// A subscriber sees the chunk as it is produced, so a long step is not silent
+// until it ends. Subscribers are registered per (run, instance) by the HTTP layer;
+// a chunk with no subscriber is dropped (a run may be created by an API caller
+// that never opened the stream).
+func (o *Orchestrator) emitLog(runID, instanceKey, chunk string) {
+	if chunk == "" {
+		return
+	}
+	if o.onLog != nil {
+		o.onLog(runID, instanceKey, chunk)
+	}
+	o.logMu.Lock()
+	sub := o.logSubs[runID+"\x00"+instanceKey]
+	o.logMu.Unlock()
+	if sub == nil {
+		return
+	}
+	select {
+	case sub <- chunk:
+	default:
+		// A slow subscriber must never block a run: drop rather than stall. The
+		// final log is available from the store, so nothing is lost permanently.
+	}
+}
+
+// SubscribeLogs registers a channel that receives a run instance's live log.
+// The returned function unsubscribes; the channel is closed on unsubscribe.
+func (o *Orchestrator) SubscribeLogs(runID, instanceKey string) (<-chan string, func()) {
+	ch := make(chan string, 256)
+	key := runID + "\x00" + instanceKey
+	o.logMu.Lock()
+	if o.logSubs == nil {
+		o.logSubs = map[string]chan string{}
+	}
+	o.logSubs[key] = ch
+	o.logMu.Unlock()
+	return ch, func() {
+		o.logMu.Lock()
+		if o.logSubs[key] == ch {
+			delete(o.logSubs, key)
+			close(ch)
+		}
+		o.logMu.Unlock()
+	}
+}
+
+// stageParallelism is the concurrency for one stage.
+//
+// `strategy.max-parallel` was parsed but never read, so a job that declared it
+// ran as wide as the server default. The stage uses the SMALLEST declared limit
+// (a limit is a "no more than", and several instances sharing a stage must all
+// respect theirs); zero means "no instance declared one", so the server default
+// applies.
+func stageParallelism(stage []*Instance, serverDefault int) int {
+	limit := 0
+	for _, inst := range stage {
+		if m := inst.Job.Strategy; m != nil && m.MaxParallel > 0 {
+			if limit == 0 || m.MaxParallel < limit {
+				limit = m.MaxParallel
+			}
+		}
+	}
+	if limit == 0 {
+		return maxInt(serverDefault, 1)
+	}
+	return limit
+}
+
+// failFast reports whether a failure in this stage stops the rest of it.
+//
+// A stage is fail-fast unless an instance explicitly set `fail-fast: false`
+// (GitHub's default is true for a matrix).
+func failFast(stage []*Instance) bool {
+	for _, inst := range stage {
+		if m := inst.Job.Strategy; m != nil && !m.FailFast {
+			return false
+		}
+	}
+	return true
 }

@@ -2,9 +2,11 @@ package gateway
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/easydev-org/easydev-platform/internal/ci"
 )
@@ -184,6 +186,11 @@ func (g *Gateway) ciRun(w http.ResponseWriter, r *http.Request, tenant, tail str
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"canceled": id, "tenant": tenant})
 
+	case strings.Contains(tail, "/logs/") && r.Method == http.MethodGet:
+		// GET /api/v1/{ns}/ci/runs/{id}/logs/{instanceKey}  ->  live log stream
+		parts := strings.SplitN(tail, "/logs/", 2)
+		g.ciStreamLogs(w, r, tenant, parts[0], parts[1])
+
 	case strings.HasSuffix(tail, "/rerun") && r.Method == http.MethodPost:
 		g.ciRerun(w, r, tenant, strings.TrimSuffix(tail, "/rerun"))
 
@@ -352,4 +359,92 @@ func firstNonEmptyStr(list ...string) string {
 		}
 	}
 	return ""
+}
+
+// ciStreamLogs streams one job instance's log while it runs.
+//
+// It is a plain text/event-stream over HTTP: a step that takes minutes would
+// otherwise be silent until it finished (the run record only carries the tail).
+// The stream ends when the run reaches a terminal state, so a client can simply
+// read until close.
+func (g *Gateway) ciStreamLogs(w http.ResponseWriter, r *http.Request, tenant, runID, instanceKey string) {
+	if g.cfg.CI == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "ci is not configured"})
+		return
+	}
+	run, err := g.cfg.CIStore.GetRun(r.Context(), runID)
+	if err != nil || run.Namespace != tenant {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "run not found"})
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "streaming is not supported"})
+		return
+	}
+	ch, unsubscribe := g.cfg.CI.SubscribeLogs(runID, instanceKey)
+	defer unsubscribe()
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	// Send the log already captured so a late subscriber is not blind.
+	if inst := findInstance(run, instanceKey); inst != nil && inst.LogsTail != "" {
+		_, _ = io.WriteString(w, inst.LogsTail)
+	}
+	flusher.Flush()
+	// A run that is already over will never produce another chunk: end NOW
+	// instead of waiting for the first tick (a client should not sit for a second
+	// on a finished run).
+	if run.State.Terminal() {
+		return
+	}
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case chunk, ok := <-ch:
+			if !ok {
+				return
+			}
+			if _, werr := io.WriteString(w, chunk); werr != nil {
+				return
+			}
+			flusher.Flush()
+		case <-ticker.C:
+			// End the stream once the run is terminal AND nothing more will come.
+			cur, gerr := g.cfg.CIStore.GetRun(r.Context(), runID)
+			if gerr != nil {
+				return
+			}
+			if cur.State.Terminal() {
+				// Drain what is buffered, then stop.
+				for {
+					select {
+					case chunk, ok := <-ch:
+						if !ok {
+							return
+						}
+						_, _ = io.WriteString(w, chunk)
+					default:
+						flusher.Flush()
+						return
+					}
+				}
+			}
+		}
+	}
+}
+
+// findInstance returns the job instance with the given key.
+func findInstance(run *ci.Run, key string) *ci.JobResult {
+	for i := range run.Jobs {
+		if run.Jobs[i].Key == key {
+			return &run.Jobs[i]
+		}
+	}
+	return nil
 }
