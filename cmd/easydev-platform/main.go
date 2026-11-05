@@ -155,7 +155,12 @@ func main() {
 			log.Printf("platform: CI falling back to the in-memory store: %v", serr)
 		}
 	}
-	orch := ci.NewOrchestrator(ciStore, ciOpsClient).WithConcurrency(ci.NewConcurrencyGate(ciStore))
+	// WithVCS tells the in-container supervisor how to fetch the source tree: the
+	// checkout now happens ONCE per job (inside the script that runs all of its
+	// steps), not once per step.
+	orch := ci.NewOrchestrator(ciStore, ciOpsClient).
+		WithConcurrency(ci.NewConcurrencyGate(ciStore)).
+		WithVCS(baseVCS, "admin", *admin)
 	orch.WithLogCap(8192)
 
 	gw, err := gateway.New(gateway.Config{

@@ -2,6 +2,7 @@ package ci
 
 import (
 	"context"
+	"encoding/base64"
 	"strings"
 	"testing"
 	"time"
@@ -233,14 +234,28 @@ func TestOrchestratorSuccessAndChecks(t *testing.T) {
 			t.Fatalf("job %s = %s/%d", j.Key, j.State, j.ExitCode)
 		}
 	}
-	// Every STEP is one executor job: 2 (test) + 1 (build) = 3.
-	if got := len(ops.Specs()); got != 3 {
-		t.Fatalf("executor calls = %d, want 3", got)
+	// ONE executor job per job instance (all steps share it): test + build = 2.
+	//
+	// This is the whole point of the supervisor: a per-step executor job meant a
+	// fresh empty workspace per step, so "compile then test" could not work.
+	if got := len(ops.Specs()); got != 2 {
+		t.Fatalf("executor calls = %d, want 2 (one per instance)", got)
 	}
-	// Checkout must be pinned to the head snapshot, never a branch.
+	// The combined script must carry BOTH of test's steps. Step bodies are
+	// BASE64-ENCODED inside the script (a workflow may contain any text, so a
+	// literal heredoc would be an injection vector), so the assertion decodes.
+	script := ops.Specs()[0].Commands[0]
+	decoded := decodeStepBodies(t, script)
+	for _, want := range []string{"go vet ./...", "go test ./..."} {
+		if !strings.Contains(decoded, want) {
+			t.Errorf("the supervisor script is missing %q (decoded bodies:\n%s)", want, decoded)
+		}
+	}
+	// The checkout is pinned to the head snapshot and happens ONCE, inside the
+	// supervisor script (the executor no longer receives a Checkout).
 	for _, s := range ops.Specs() {
-		if s.Checkout == nil || s.Checkout.Ref != "head-sha" {
-			t.Fatalf("step %s checkout = %+v, want ref=head-sha", s.Name, s.Checkout)
+		if !strings.Contains(s.Commands[0], "archive/head-sha.tar.gz") {
+			t.Errorf("the script does not check out head-sha:\n%s", s.Commands[0])
 		}
 	}
 	checks, _ := st.ListChecks(context.Background(), "team-app", 7)
@@ -320,8 +335,12 @@ func TestJobOutputsAndIf(t *testing.T) {
 	st := NewMemStore()
 	ops := NewFakeOps()
 	ops.LogFor = func(spec JobSpec) string {
-		// meta step emits an output via the marker the supervisor uses.
-		return "##[easydev:outputs]\nversion=1.2.3\n"
+		// The supervisor reports every step's outcome and outputs at the END of
+		// the script (all steps share one container, so Go cannot observe them
+		// between steps).
+		return "##[easydev:result] summary\n" +
+			"##[easydev:result] 0 success 0\n" +
+			"##[easydev:step-outputs] 0\nversion=1.2.3\n"
 	}
 	o := NewOrchestrator(st, ops)
 	wf, err := ParseWorkflow([]byte(`
@@ -374,4 +393,30 @@ func waitTerminal(t *testing.T, s Store, id string) *Run {
 	}
 	t.Fatalf("run %s did not finish", id)
 	return nil
+}
+
+// decodeStepBodies extracts and decodes every base64 step body the supervisor
+// script embeds, so tests can assert on the workflow's actual content.
+func decodeStepBodies(t *testing.T, script string) string {
+	t.Helper()
+	var out strings.Builder
+	for _, line := range strings.Split(script, "\n") {
+		// printf '%s' '<b64>' | base64 -d > ...
+		i := strings.Index(line, "printf '%s' '")
+		if i < 0 {
+			continue
+		}
+		rest := line[i+len("printf '%s' '"):]
+		j := strings.Index(rest, "'")
+		if j < 0 {
+			continue
+		}
+		b, err := base64.StdEncoding.DecodeString(rest[:j])
+		if err != nil {
+			t.Fatalf("bad base64 step body: %v", err)
+		}
+		out.WriteString(string(b))
+		out.WriteString("\n")
+	}
+	return out.String()
 }

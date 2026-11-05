@@ -34,7 +34,7 @@ Run = (namespace, workflow_path, workflow_sha, ref, head, base)
 ```
 rr opened/synced ──► read .easydev/workflows/ci.yml @ BASE snapshot
                  ──► parse ──► expand matrix ──► DAG stages
-                 ──► per step: CreateJob(archive @ HEAD snapshot) ──► checks
+                 ──► per JOB INSTANCE: CreateJob (all steps) ──► checks
 ```
 
 ## 2. Workflow file
@@ -175,8 +175,8 @@ silently do nothing), and a required input with no value fails the step.
 ## 4. Execution
 
 ```
-orchestrator ──► stage (parallel instances) ──► one STEP = one backend job
-                                                 │
+orchestrator ──► stage (parallel instances) ──► ONE job instance = ONE backend job
+                                                 │   (all of its steps, in order)
                                                  ├─ k8s batch/v1.Job (easyops)
                                                  ├─ Connect OpsService (production)
                                                  ├─ self-hosted runner (optional)
@@ -185,9 +185,39 @@ orchestrator ──► stage (parallel instances) ──► one STEP = one backe
 
 `OpsClient` is the seam; adding a backend does not touch the orchestrator.
 
-### 4.1 Checkout
+### 4.1 One job instance = one container (the supervisor)
 
-The executor prefixes the step's script with
+A job's steps run **sequentially inside one container**, generated as a single
+shell script. This is what makes the model behave like a runner:
+
+- **`/workspace` is shared**, so "compile in step 1, test the artifact in step 2"
+  works. (One executor job per *step* gave each step a fresh emptyDir, which
+  made the most common pipeline impossible.)
+- The checkout happens **once**, not once per step.
+- Companion services are started once, not per step.
+- There is no way for two steps to collide on an executor name.
+
+The trade-off: Go can no longer intervene between steps, so anything that depends
+on runtime state is decided **in the container**:
+
+| Concern | How it is handled |
+|---|---|
+| `if:` | compiled to a POSIX shell gate (`expr.ShellCompile`) |
+| `steps.<id>.outputs.<k>` | read from `/workspace/.easydev/out/<index>` by `easydev_out` |
+| step outcome / exit code | written to a `##[easydev:result]` block at the END of the log |
+| step env | exported inside the step's subshell, so it cannot leak forward |
+| `continue-on-error` | reports failure without failing the job or tainting `success()` |
+
+Step bodies are embedded **base64-encoded**: a workflow may contain any text, so
+a literal heredoc delimiter (or a forged `##[easydev:result]` line) would be an
+injection vector.
+
+A step with no `if:` implicitly requires every previous step to have succeeded —
+that is what makes `if: always()` meaningful.
+
+### 4.2 Checkout
+
+The supervisor script starts with
 
 ```sh
 curl -fsSL -u "$EASYDEV_CHECKOUT_AUTH" \
@@ -197,6 +227,7 @@ curl -fsSL -u "$EASYDEV_CHECKOUT_AUTH" \
 - No git client, no clone cache.
 - The tree is **byte-for-byte the pinned snapshot** the workflow was read from.
 - The credential travels in an environment variable, never in the script.
+- It runs **once per job**, before the first step sees the tree.
 
 ### 4.2 Untrusted code
 
@@ -273,6 +304,8 @@ Implemented and covered by tests (`internal/ci`, `internal/wf`,
 | parsing, v1 compatibility, matrix (include/exclude), `if:`, `needs`, outputs | done |
 | expression language (`internal/ci/expr`) | done |
 | `uses:` resolution to a subtree at a pinned ref; shell + composite actions | done |
+| one executor job per instance: steps share `/workspace`, checkout once | done |
+| runtime `if:` gates, per-step env isolation, `continue-on-error` | done |
 | per-step execution with a pinned-snapshot checkout | done |
 | step → job output propagation (`$EASYDEV_OUTPUT` marker) | done |
 | checks + merge gate (409 before easyvcs sees the merge) | done |
@@ -291,7 +324,10 @@ Next:
 3. **Event source** — an easyvcs `AuditSink` (the `rr-merge` / `commit` events
    are already recorded there) or a signed webhook, so runs start without a
    manual `POST /ci/events`.
-4. **Tekton-style multi-container steps** — one container per step inside one
-   Pod, for per-step images without a Job each.
+4. **Per-step images inside one Pod** — today a job runs in ONE image (the job's
+   container). Supporting `uses: docker://...` or a step-level `container:`
+   needs Tekton's entrypoint-rewrite pattern (one container per step in the same
+   Pod, sequenced by a supervisor). The current single-script supervisor is
+   deliberately simpler: it covers shell/composite actions today.
 5. **Optional self-hosted runner** — a fourth `OpsClient`, for execution outside
    the cluster.

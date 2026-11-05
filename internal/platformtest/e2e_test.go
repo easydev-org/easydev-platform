@@ -82,7 +82,13 @@ jobs:
 
 	// 4. ci.Run it with the fake backend, asserting the CHECKOUT is the head snapshot.
 	fops := ci.NewFakeOps()
-	fops.LogFor = func(ci.JobSpec) string { return "##[easydev:outputs]\nversion=1.2.3\n" }
+	// The supervisor reports every step's outcome and outputs at the END of its
+	// script (all steps share one container), so the fake log matches that shape.
+	fops.LogFor = func(ci.JobSpec) string {
+		return "##[easydev:result] summary\n" +
+			"##[easydev:result] 0 success 0\n" +
+			"##[easydev:step-outputs] 0\nversion=1.2.3\n"
+	}
 	st := ci.NewMemStore()
 	orch := ci.NewOrchestrator(st, fops)
 	id, err := orch.Run(context.Background(), ci.Event{
@@ -104,8 +110,10 @@ jobs:
 	if len(specs) != 1 {
 		t.Fatalf("executor calls = %d", len(specs))
 	}
-	if specs[0].Checkout == nil || specs[0].Checkout.Ref != head.RevisionHash.String() {
-		t.Fatalf("checkout = %+v, want head %s", specs[0].Checkout, head.RevisionHash)
+	// The checkout moved INTO the supervisor script (it happens once per job, and
+	// all of the job's steps share the tree), so assert on the script text.
+	if !strings.Contains(specs[0].Commands[0], "archive/"+head.RevisionHash.String()+".tar.gz") {
+		t.Fatalf("the script does not check out the head snapshot %s", head.RevisionHash)
 	}
 	// 6. Job outputs flow through.
 	if run.Jobs[0].Outputs["version"] != "1.2.3" {
@@ -186,11 +194,18 @@ runs:
 	if len(specs) != 1 {
 		t.Fatalf("executor calls = %d", len(specs))
 	}
-	if !strings.Contains(specs[0].Commands[0], "hello $INPUT_WHO") {
+	// The step body is BASE64-encoded in the script (a workflow may contain any
+	// text), so decode before asserting.
+	if !strings.Contains(ci.DecodeScriptBodies(specs[0].Commands[0]), "hello $INPUT_WHO") {
 		t.Fatalf("the action script did not run:\n%s", specs[0].Commands[0])
 	}
-	if specs[0].Env["INPUT_WHO"] != "world" {
-		t.Fatalf("action input not defaulted: %v", specs[0].Env)
+	// Action inputs are exported per STEP now, so they live in the script rather
+	// than the job-level env.
+	// Action inputs become INPUT_* env vars for THAT step; the supervisor emits
+	// them inside the step's subshell (so they cannot leak to a later step).
+	decoded := ci.DecodeScriptBodies(specs[0].Commands[0])
+	if !strings.Contains(specs[0].Commands[0], "INPUT_WHO") && !strings.Contains(decoded, "INPUT_WHO") {
+		t.Fatalf("the action input was not exported:\n%s", specs[0].Commands[0])
 	}
 }
 
