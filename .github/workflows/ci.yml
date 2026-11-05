@@ -1,21 +1,66 @@
 name: ci
+
 on:
-  push: { branches: [main] }
+  push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
+
 permissions:
   contents: read
+
 env:
   CGO_ENABLED: "0"
+
 jobs:
   build:
+    name: build + vet + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # go.work points at ../easyvcs and ../easyops for local development, and
+      # go.mod's replace directives point there too. CI has no siblings, so clone
+      # them and rewrite BOTH the workspace and the replaces to the clones.
+      - name: checkout the sibling modules
+        run: |
+          mkdir -p "$RUNNER_TEMP/siblings"
+          git clone --depth 1 https://github.com/easydev-org/easyvcs.git "$RUNNER_TEMP/siblings/easyvcs"
+          git clone --depth 1 https://github.com/easydev-org/easyops.git "$RUNNER_TEMP/siblings/easyops"
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
-      - run: go vet ./...
-      - run: go test ./...
-      - run: go build ./...
+
+      - name: point the workspace + replaces at the clones
+        run: |
+          cat > go.work <<EOF
+          go 1.27.2
+
+          use (
+          	.
+          	$RUNNER_TEMP/siblings/easyvcs
+          	$RUNNER_TEMP/siblings/easyops
+          )
+          EOF
+          go mod edit -replace "github.com/easylab-platform/easyvcs=$RUNNER_TEMP/siblings/easyvcs"
+          go mod edit -replace "github.com/easy-platform/easyops=$RUNNER_TEMP/siblings/easyops"
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test
+        run: go test ./...
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l ./cmd ./internal | sort || true)
+          if [ -n "$out" ]; then
+            echo "unformatted files:"
+            echo "$out"
+            exit 1
+          fi

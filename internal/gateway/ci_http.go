@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -11,23 +10,22 @@ import (
 	"github.com/easydev-org/easydev-platform/internal/ci"
 )
 
-// handleCI serves the CI surface:
+// handleCI serves the legacy (non-tenant) CI surface under /ci/.
 //
-//	POST /ci/events           {namespace, trigger, ref, base, head, rr, owner, yaml}
-//	                          -> {run_id}
-//	GET  /ci/runs?namespace=  -> {runs:[...]}
-//	GET  /ci/runs/{id}        -> a Run
-//	GET  /ci/checks?namespace=&rr= -> {checks:[...], required_pending:bool}
+// It is kept for a single-tenant deployment and for the web UI's global links.
+// The TENANT-scoped API (/api/v1/{ns}/ci/...) is the real surface: it is the one
+// that can resolve a workflow from the VCS and enforce merge gating.
 //
-// The `required_pending` flag is what a merge gate consults: when true, a merge
-// must be REFUSED (a required check is not green).
+//	GET /ci/runs?namespace=     list runs
+//	GET /ci/runs/{id}           one run
+//	GET /ci/checks?namespace=&rr=
+//
+// There is deliberately NO yaml-accepting trigger here: a workflow always comes
+// from the VCS, so the only way to start a run is the tenant-scoped events route.
 func (g *Gateway) handleCI(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/ci")
-	path = strings.TrimSuffix(path, "/")
+	path := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/ci"), "/")
 
 	switch {
-	case path == "/events" && r.Method == http.MethodPost:
-		g.ciEvent(w, r)
 	case path == "/runs" && r.Method == http.MethodGet:
 		g.ciListRuns(w, r)
 	case strings.HasPrefix(path, "/runs/") && r.Method == http.MethodGet:
@@ -38,40 +36,20 @@ func (g *Gateway) handleCI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ci": true,
 			"endpoints": []string{
-				"POST /ci/events", "GET /ci/runs?namespace=", "GET /ci/runs/{id}",
-				"GET /ci/checks?namespace=&rr=",
+				"POST /api/v1/{ns}/ci/events",
+				"GET  /api/v1/{ns}/ci/runs",
+				"GET  /api/v1/{ns}/ci/runs/{id}",
+				"POST /api/v1/{ns}/ci/runs/{id}/cancel",
+				"POST /api/v1/{ns}/ci/runs/{id}/rerun",
+				"GET  /api/v1/{ns}/ci/checks?rr=",
+				"GET  /api/v1/{ns}/ci/workflows?ref=",
+				"GET  /ci/runs?namespace=",
+				"GET  /ci/checks?namespace=&rr=",
 			},
 		})
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
 	}
-}
-
-func (g *Gateway) ciEvent(w http.ResponseWriter, r *http.Request) {
-	if g.cfg.CI == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "ci is not configured"})
-		return
-	}
-	var ev ci.Event
-	if err := decode(r, &ev); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	if ev.Namespace == "" || ev.Trigger == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "namespace and trigger are required"})
-		return
-	}
-	id, err := g.cfg.CI.Run(r.Context(), ev)
-	if err != nil {
-		// "does not trigger" is not an error for the caller: no pipeline ran.
-		if strings.Contains(err.Error(), "does not trigger") {
-			writeJSON(w, http.StatusOK, map[string]any{"skipped": true, "reason": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"run_id": id})
 }
 
 func (g *Gateway) ciListRuns(w http.ResponseWriter, r *http.Request) {
@@ -101,11 +79,7 @@ func (g *Gateway) ciGetRun(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	run, err := g.cfg.CIStore.GetRun(r.Context(), id)
 	if err != nil {
-		if errors.Is(err, ci.ErrNotFound) {
-			writeJSON(w, http.StatusNotFound, map[string]any{"error": "run not found"})
-			return
-		}
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "run not found"})
 		return
 	}
 	writeJSON(w, http.StatusOK, run)
@@ -123,32 +97,28 @@ func (g *Gateway) ciChecks(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	// required_pending is the merge gate: a required check that has not passed
-	// blocks the merge.
-	pending := false
-	for _, c := range checks {
-		if c.Required && c.State != ci.RunSuccess {
-			pending = true
-		}
-	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"checks": checks, "required_pending": pending,
+		"checks": checks, "required_pending": g.requiredPending(r, ns, rr),
 	})
 }
 
+// decode reads a bounded JSON body.
 func decode(r *http.Request, v any) error {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		return err
 	}
-	if len(body) == 0 {
-		return errors.New("empty body")
+	if len(strings.TrimSpace(string(body))) == 0 {
+		return nil
 	}
 	return json.Unmarshal(body, v)
 }
 
+// writeJSON writes a JSON response.
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
 }
+
+var _ = ci.RunSuccess

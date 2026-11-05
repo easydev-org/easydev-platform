@@ -1,0 +1,47 @@
+# The platform's own CI. This file is what EasyDev CI itself would run: it uses
+# the same schema documented in docs/ci.md, so the platform exercises its own
+# format (and a schema regression breaks the platform's own build).
+version: 1
+name: ci
+
+on:
+  rr:
+    types: [opened, synced]
+  manual: true
+
+env:
+  CGO_ENABLED: "0"
+
+jobs:
+  build:
+    runs-on: [linux]
+    timeout-minutes: 20
+    required: true
+    container:
+      image: golang:1.27
+    steps:
+      - uses: easydev-org/ci-actions/checkout@v1
+        with:
+          ref: ${{ easyvcs.head }}
+      - name: gofmt
+        run: |
+          out=$(gofmt -l ./cmd ./internal)
+          if [ -n "$out" ]; then echo "unformatted:"; echo "$out"; exit 1; fi
+
+  test:
+    needs: [build]
+    runs-on: [linux]
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        go: ["1.27"]
+    container:
+      image: golang:1.27
+    steps:
+      - uses: easydev-org/ci-actions/checkout@v1
+        with:
+          ref: ${{ easyvcs.head }}
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test ./...

@@ -44,6 +44,27 @@ type Config struct {
 	CIStore ci.Store
 	// Ops is the tenant-safe ops engine (nil = disabled).
 	Ops *ops.Engine
+	// Workflows resolves workflow/action files out of the VCS. It is REQUIRED
+	// for CI: a run never accepts YAML from a request body.
+	Workflows WorkflowSource
+	// RequireCI gate: when true (the default for a multi-tenant deployment), an
+	// RR merge is refused while a required check is pending.
+	GateMerges bool
+}
+
+// WorkflowSource resolves workflow + action files from the VCS. It is
+// implemented by internal/wf.Source; the interface lives here so the gateway can
+// be tested without a store.
+type WorkflowSource interface {
+	// Workflow loads and parses a workflow at path from snapshot sha ("" = the
+	// default branch). It returns the parsed workflow and the path it used.
+	Workflow(ns, sha, path string) (*ci.Workflow, string, error)
+	// ListWorkflows lists the workflow files at a snapshot.
+	ListWorkflows(ns, sha string) ([]string, error)
+	// ResolveSnapshot turns a ref into a snapshot sha.
+	ResolveSnapshot(ns, ref string) (string, error)
+	// Load implements ci.ActionResolver (action.yml at a pinned ref).
+	Load(ref *ci.ActionRef) ([]byte, bool, error)
 }
 
 // Gateway is an http.Handler that routes by prefix.
@@ -157,6 +178,10 @@ func (g *Gateway) serveGlobal(w http.ResponseWriter, r *http.Request, seg string
 
 // serveVCS rewrites the platform path to the easyvcs path shape and hands the
 // request to the embedded easyvcs router.
+//
+// The RR-merge path is special: when merge gating is on, a required check that
+// is not green REFUSES the merge with 409. The VCS itself stays a pure engine
+// that knows nothing about CI.
 func (g *Gateway) serveVCS(w http.ResponseWriter, r *http.Request, ns, seg string) {
 	if g.cfg.VCS == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "vcs is not configured"})
@@ -170,7 +195,12 @@ func (g *Gateway) serveVCS(w http.ResponseWriter, r *http.Request, ns, seg strin
 	// Tell the identity resolver which tenant this is (the path is now easyvcs'
 	// own shape). Always overwrite: a client-supplied value must never survive.
 	r2.Header.Set(tenant.TenantHeader, ns)
-	g.cfg.VCS.Router().ServeHTTP(w, r2)
+
+	var h http.Handler = g.cfg.VCS.Router()
+	if g.cfg.GateMerges {
+		h = g.gateMerge(h)
+	}
+	h.ServeHTTP(w, r2)
 }
 
 // legacyRoutes keeps the old (namespaced) mounting available when someone wires
