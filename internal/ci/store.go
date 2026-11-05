@@ -100,6 +100,9 @@ type Run struct {
 	Owner string `json:"owner"`
 	// Actor is the user whose change caused the event (for RRs: the author).
 	Actor string `json:"actor,omitempty"`
+	// Group is the resolved concurrency group this run belongs to ("" = none).
+	// Persisted so the gate is truthful across replicas.
+	Group string `json:"group,omitempty"`
 }
 
 // Check is a merge-blocking status shown on a Revision Request. One check per
@@ -126,7 +129,7 @@ type Store interface {
 	ListRuns(ctx context.Context, namespace string, limit int) ([]*Run, error)
 	PutCheck(ctx context.Context, c *Check) error
 	ListChecks(ctx context.Context, namespace string, rr int64) ([]*Check, error)
-	// CancelRunState records a cancellation request for a run id.
+	// CancelRun records a cancellation request for a run id.
 	CancelRun(ctx context.Context, id string) error
 }
 
@@ -213,10 +216,12 @@ func (m *MemStore) ListChecks(ctx context.Context, namespace string, rr int64) (
 func (m *MemStore) CancelRun(ctx context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.runs[id]; !ok {
+	r, ok := m.runs[id]
+	if !ok {
 		return ErrNotFound
 	}
 	m.canceled[id] = true
+	r.State = RunCanceled
 	return nil
 }
 
@@ -225,6 +230,27 @@ func (m *MemStore) isCanceled(id string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.canceled[id]
+}
+
+// IsCanceled implements Cancelable.
+func (m *MemStore) IsCanceled(ctx context.Context, id string) bool { return m.isCanceled(id) }
+
+// LiveRunInGroup implements GroupQuerier.
+func (m *MemStore) LiveRunInGroup(ctx context.Context, group, excludeRunID string) (string, error) {
+	if group == "" {
+		return "", nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, r := range m.runs {
+		if id == excludeRunID || r.Group != group {
+			continue
+		}
+		if !r.State.Terminal() {
+			return id, nil
+		}
+	}
+	return "", nil
 }
 
 // itoa is a tiny int64 formatter to avoid importing strconv in this file.

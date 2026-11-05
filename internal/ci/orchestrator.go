@@ -98,6 +98,17 @@ type Orchestrator struct {
 	opsFor func(tenant string) OpsClient
 	// logCap bounds the inline log tail stored on a result.
 	logCap int
+	// gate enforces `concurrency:` when the workflow declares it (nil = off).
+	gate *ConcurrencyGate
+	// mu guards seq (run-id uniqueness within one process).
+	mu  sync.Mutex
+	seq uint64
+}
+
+// WithConcurrency enables `concurrency:` enforcement.
+func (o *Orchestrator) WithConcurrency(g *ConcurrencyGate) *Orchestrator {
+	o.gate = g
+	return o
 }
 
 // NewOrchestrator wires an orchestrator.
@@ -154,7 +165,7 @@ func (o *Orchestrator) Run(ctx context.Context, ev Event) (string, error) {
 
 	now := o.now().UTC().UnixMilli()
 	run := &Run{
-		ID:           fmt.Sprintf("run-%d-%s", now, sanitize(ev.Namespace+"-"+firstNonEmpty(ev.Ref, ev.Tag, "manual"))),
+		ID:           o.newRunID(now, ev.Namespace, firstNonEmpty(ev.Ref, ev.Tag, "manual")),
 		Namespace:    ev.Namespace,
 		Workflow:     wf.Name,
 		WorkflowPath: ev.WorkflowPath,
@@ -170,6 +181,14 @@ func (o *Orchestrator) Run(ctx context.Context, ev Event) (string, error) {
 		Created:      now,
 		Owner:        ev.Owner,
 		Actor:        ev.Actor,
+	}
+	// `concurrency:` — at most one live run per group.
+	if wf.Concurrency != nil && o.gate != nil {
+		group := GroupOf(wf.Concurrency.Group, run)
+		run.Group = group
+		if _, err := o.gate.Acquire(ctx, group, run, wf.Concurrency.CancelInProgress); err != nil {
+			return "", err
+		}
 	}
 	for _, stage := range plan.Stages {
 		for _, inst := range stage {
@@ -453,6 +472,21 @@ func (o *Orchestrator) runStep(ctx context.Context, run *Run, inst *Instance, st
 	return res, logs
 }
 
+// newRunID builds a unique run id.
+//
+// The timestamp is not enough on its own: two runs created in the same
+// millisecond (a re-run, or two events delivered together) would collide and the
+// store would silently overwrite one. A monotonic counter keeps ids unique and
+// ordered within the process; across replicas the nanosecond suffix plus the
+// counter is enough in practice (an id is a handle, not a security boundary).
+func (o *Orchestrator) newRunID(now int64, ns, slug string) string {
+	o.mu.Lock()
+	o.seq++
+	seq := o.seq
+	o.mu.Unlock()
+	return fmt.Sprintf("run-%d-%d-%s", now, seq, sanitize(ns+"-"+slug))
+}
+
 // baseVars builds the expression variable tree for one job instance.
 //
 // `needs` exposes the OUTPUTS of instances that already finished (always in an
@@ -501,7 +535,13 @@ func (o *Orchestrator) baseVars(run *Run, inst *Instance, wf *Workflow, results 
 }
 
 // canceled reports whether the run was asked to stop.
+//
+// It asks the store first (a SQLStore sees a cancellation issued by ANOTHER
+// replica), then falls back to the run's own state.
 func (o *Orchestrator) canceled(ctx context.Context, runID string) bool {
+	if c, ok := o.store.(Cancelable); ok {
+		return c.IsCanceled(ctx, runID)
+	}
 	if s, ok := o.store.(*MemStore); ok {
 		return s.isCanceled(runID)
 	}

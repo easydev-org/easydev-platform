@@ -5,6 +5,10 @@ go 1.27.2
 require (
 	github.com/easy-platform/easyops v0.0.0
 	github.com/easylab-platform/easyvcs v0.0.0
+	gorm.io/driver/mysql v1.6.0
+	gorm.io/driver/postgres v1.6.2
+	gorm.io/driver/sqlite v1.6.0
+	gorm.io/gorm v1.31.2
 	sigs.k8s.io/yaml v1.6.0
 )
 
@@ -55,6 +59,7 @@ require (
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
+	github.com/mattn/go-sqlite3 v1.14.22 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
@@ -82,9 +87,6 @@ require (
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
-	gorm.io/driver/mysql v1.6.0 // indirect
-	gorm.io/driver/postgres v1.6.2 // indirect
-	gorm.io/gorm v1.31.2 // indirect
 	k8s.io/api v0.37.0 // indirect
 	k8s.io/apimachinery v0.37.0 // indirect
 	k8s.io/client-go v0.37.0 // indirect

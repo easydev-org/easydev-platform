@@ -136,8 +136,27 @@ func main() {
 		ciOpsClient = ci.NewFakeOps()
 		log.Printf("platform: CI using the in-process fake ops backend")
 	}
-	ciStore := ci.NewMemStore()
-	orch := ci.NewOrchestrator(ciStore, ciOpsClient)
+	ciStore := ci.Store(ci.NewMemStore())
+	// Durable CI state: reuse the deployment's database so a run survives a
+	// restart. A failure here is not fatal (a single-process deployment keeps the
+	// in-memory store), but it is noisy because runs would be lost on restart.
+	if *driver == "postgres" || *driver == "mysql" || *driver == "mariadb" {
+		if s, serr := ci.OpenStore(*driver, *dsn); serr == nil {
+			ciStore = s
+			log.Printf("platform: CI state in %s", *driver)
+		} else {
+			log.Printf("platform: CI falling back to the in-memory store: %v", serr)
+		}
+	} else {
+		if s, serr := ci.OpenStore("sqlite", *data+"/ci.db"); serr == nil {
+			ciStore = s
+			log.Printf("platform: CI state in sqlite %s", *data+"/ci.db")
+		} else {
+			log.Printf("platform: CI falling back to the in-memory store: %v", serr)
+		}
+	}
+	orch := ci.NewOrchestrator(ciStore, ciOpsClient).WithConcurrency(ci.NewConcurrencyGate(ciStore))
+	orch.WithLogCap(8192)
 
 	gw, err := gateway.New(gateway.Config{
 		VCS:        vcs,
