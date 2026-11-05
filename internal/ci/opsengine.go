@@ -123,18 +123,7 @@ func (o *EngineOps) materialise(spec JobSpec) (string, map[string]string) {
 	var b strings.Builder
 	b.WriteString("set -e\n")
 
-	workdir := spec.WorkDir
-	if workdir == "" {
-		workdir = "."
-	}
 	b.WriteString("mkdir -p /workspace\ncd /workspace\n")
-	if workdir != "." && workdir != "" {
-		b.WriteString("mkdir -p ")
-		b.WriteString(shellQuote(workdir))
-		b.WriteString(" && cd ")
-		b.WriteString(shellQuote(workdir))
-		b.WriteString("\n")
-	}
 
 	if spec.Checkout != nil {
 		url := spec.Checkout.URL
@@ -145,9 +134,20 @@ func (o *EngineOps) materialise(spec JobSpec) (string, map[string]string) {
 		if dest == "" {
 			dest = "."
 		}
+		// Check out BEFORE changing into the working directory: the workdir is
+		// usually a subdirectory OF the checkout.
 		b.WriteString(checkoutScript(url, dest, o.VCSUser, o.VCSToken))
 		env["EASYDEV_CHECKOUT_REF"] = spec.Checkout.Ref
 		env["EASYDEV_CHECKOUT_PATH"] = spec.Checkout.Path
+	}
+
+	workdir := spec.WorkDir
+	if workdir != "" && workdir != "." {
+		b.WriteString("mkdir -p ")
+		b.WriteString(shellQuote(workdir))
+		b.WriteString(" && cd ")
+		b.WriteString(shellQuote(workdir))
+		b.WriteString("\n")
 	}
 
 	// Step output channel: the script writes NAME=VALUE lines to this file and
