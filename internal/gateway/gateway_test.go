@@ -7,17 +7,54 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/easylab-platform/easyvcs/server"
+	"github.com/easylab-platform/easyvcs/store"
+
 	"github.com/easydev-org/easydev-platform/internal/ci"
 	"github.com/easydev-org/easydev-platform/internal/ops"
 )
 
-// TestOpsTenantIsolationOverHTTP is the P1 end-to-end property: two tenants can
+// fakeWorkflows is an in-memory WorkflowSource.
+type fakeWorkflows struct {
+	wf   *ci.Workflow
+	path string
+	err  error
+}
+
+func (f *fakeWorkflows) Workflow(ns, sha, path string) (*ci.Workflow, string, error) {
+	if f.err != nil {
+		return nil, "", f.err
+	}
+	p := f.path
+	if p == "" {
+		p = ci.DefaultWorkflowPath
+	}
+	return f.wf, p, nil
+}
+func (f *fakeWorkflows) ListWorkflows(ns, sha string) ([]string, error) {
+	return []string{ci.DefaultWorkflowPath}, nil
+}
+func (f *fakeWorkflows) ResolveSnapshot(ns, ref string) (string, error) {
+	if ref == "" {
+		return "snap-main", nil
+	}
+	return "snap-" + ref, nil
+}
+func (f *fakeWorkflows) Load(ref *ci.ActionRef) ([]byte, bool, error) { return nil, false, nil }
+
+func mustWorkflow(t *testing.T, src string) *ci.Workflow {
+	t.Helper()
+	w, err := ci.ParseWorkflow([]byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
+
+// TestOpsTenantIsolationOverHTTP is the end-to-end property: two tenants can
 // each create a job with the SAME name, get distinct k8s names, and can never
 // see or delete each other's job — all over HTTP.
 func TestOpsTenantIsolationOverHTTP(t *testing.T) {
-	// No k8s in a unit test: the engine is wrapped around a nil JobRunner, so
-	// SubmitJob reports "not configured". We exercise the REGISTRY path (list/get/
-	// delete isolation) by seeding rows directly.
 	reg := ops.NewMemRegistry()
 	engine := ops.NewEngine(reg, nil)
 	g, err := New(Config{Ops: engine, CI: ci.NewOrchestrator(ci.NewMemStore(), ci.NewFakeOps()), CIStore: ci.NewMemStore()})
@@ -25,7 +62,6 @@ func TestOpsTenantIsolationOverHTTP(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Seed a job for team-a straight into the registry (stands in for a k8s job).
 	if _, err := reg.Create(t.Context(), &ops.Resource{
 		Namespace: "team-a", Kind: ops.KindJob, Name: "build", Owner: "alice", State: "running",
 	}); err != nil {
@@ -39,13 +75,11 @@ func TestOpsTenantIsolationOverHTTP(t *testing.T) {
 		return rec.Code, rec.Body.String()
 	}
 
-	// team-a sees its job.
 	code, body := do(http.MethodGet, "/api/v1/team-a/ops/jobs")
 	if code != 200 || !strings.Contains(body, `"build"`) {
 		t.Fatalf("team-a list: %d %s", code, body)
 	}
 
-	// team-b sees NOTHING.
 	code, body = do(http.MethodGet, "/api/v1/team-b/ops/jobs")
 	if code != 200 {
 		t.Fatalf("team-b list: %d %s", code, body)
@@ -58,19 +92,16 @@ func TestOpsTenantIsolationOverHTTP(t *testing.T) {
 		t.Fatalf("team-b must see no jobs, got %d: %s", len(list.Jobs), body)
 	}
 
-	// team-b cannot GET team-a's job (404, not 403: existence never leaks).
 	code, _ = do(http.MethodGet, "/api/v1/team-b/ops/jobs/build")
 	if code != http.StatusNotFound {
 		t.Fatalf("cross-tenant get = %d, want 404", code)
 	}
 
-	// team-b cannot DELETE it either.
 	code, _ = do(http.MethodDelete, "/api/v1/team-b/ops/jobs/build")
 	if code != http.StatusNotFound {
 		t.Fatalf("cross-tenant delete = %d, want 404", code)
 	}
 
-	// team-a's job is intact.
 	code, _ = do(http.MethodGet, "/api/v1/team-a/ops/jobs/build")
 	if code != http.StatusOK {
 		t.Fatalf("owner get = %d", code)
@@ -80,14 +111,17 @@ func TestOpsTenantIsolationOverHTTP(t *testing.T) {
 // TestCITenantIsolationOverHTTP: a run created for team-a is invisible to team-b
 // and a body naming another tenant is rejected.
 func TestCITenantIsolationOverHTTP(t *testing.T) {
-	store := ci.NewMemStore()
-	orch := ci.NewOrchestrator(store, ci.NewFakeOps())
-	g, err := New(Config{CI: orch, CIStore: store})
+	st := ci.NewMemStore()
+	orch := ci.NewOrchestrator(st, ci.NewFakeOps())
+	wf := mustWorkflow(t, "version: 1\non: [rr_opened]\njobs:\n  t:\n    container: {image: busybox}\n    steps: [{run: 'true'}]\n")
+	g, err := New(Config{
+		CI: orch, CIStore: st,
+		Workflows: &fakeWorkflows{wf: wf},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	yaml := "version: 1\non: [rr_opened]\njobs:\n  t:\n    image: busybox\n    commands: [\"true\"]\n"
-	body := `{"trigger":"rr_opened","ref":"main","head":"deadbeef","rr":1,"yaml":` + jsonString(yaml) + `}`
+	body := `{"event":"rr_opened","ref":"main","base":"snap-base","head":"deadbeef","rr":1}`
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/team-a/ci/events", strings.NewReader(body))
 	rec := httptest.NewRecorder()
@@ -96,7 +130,6 @@ func TestCITenantIsolationOverHTTP(t *testing.T) {
 		t.Fatalf("trigger = %d %s", rec.Code, rec.Body.String())
 	}
 
-	// team-a lists 1 run; team-b lists 0.
 	get := func(path string) string {
 		r := httptest.NewRequest(http.MethodGet, path, nil)
 		w := httptest.NewRecorder()
@@ -110,8 +143,7 @@ func TestCITenantIsolationOverHTTP(t *testing.T) {
 		t.Fatalf("team-b must have no runs: %s", b)
 	}
 
-	// A body naming another tenant is rejected.
-	bad := `{"namespace":"team-b","trigger":"rr_opened","head":"x","yaml":` + jsonString(yaml) + `}`
+	bad := `{"namespace":"team-b","event":"rr_opened","head":"x"}`
 	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/team-a/ci/events", strings.NewReader(bad))
 	rec2 := httptest.NewRecorder()
 	g.ServeHTTP(rec2, req2)
@@ -120,7 +152,126 @@ func TestCITenantIsolationOverHTTP(t *testing.T) {
 	}
 }
 
-// TestVCSRoutingIsClaimedBeforeCatchAll pins D1-3: the platform claims /ops and
+// TestCITriggerNeverAcceptsYAML is the security property: a body carrying a
+// workflow definition is IGNORED (the workflow comes from the VCS).
+func TestCITriggerNeverAcceptsYAML(t *testing.T) {
+	st := ci.NewMemStore()
+	orch := ci.NewOrchestrator(st, ci.NewFakeOps())
+	wf := mustWorkflow(t, "version: 1\non: [rr_opened]\njobs:\n  safe:\n    container: {image: busybox}\n    steps: [{run: 'true'}]\n")
+	g, err := New(Config{CI: orch, CIStore: st, Workflows: &fakeWorkflows{wf: wf}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A body that tries to define an evil workflow.
+	body := `{"event":"rr_opened","ref":"main","head":"h","rr":2,
+		"yaml":"on: [rr_opened]\njobs:\n  evil: {image: attacker, commands: [curl evil]}"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/team-a/ci/events", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	g.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("trigger = %d %s", rec.Code, rec.Body.String())
+	}
+	// The run must carry the VCS workflow's name and jobs, not the body's.
+	runs, _ := st.ListRuns(t.Context(), "team-a", 10)
+	if len(runs) != 1 {
+		t.Fatalf("runs = %d", len(runs))
+	}
+	for _, j := range runs[0].Jobs {
+		if j.JobID == "evil" {
+			t.Fatal("the body's yaml must never define a job")
+		}
+	}
+}
+
+// TestCITriggerSkippedWhenNoWorkflow: a repository with no workflow file is a
+// 200 "skipped", not an error.
+func TestCITriggerSkippedWhenNoWorkflow(t *testing.T) {
+	st := ci.NewMemStore()
+	orch := ci.NewOrchestrator(st, ci.NewFakeOps())
+	g, err := New(Config{CI: orch, CIStore: st, Workflows: &fakeWorkflows{err: errNotFoundStub}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/team-a/ci/events",
+		strings.NewReader(`{"event":"rr_opened","head":"h"}`))
+	rec := httptest.NewRecorder()
+	g.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"skipped":true`) {
+		t.Fatalf("no-workflow = %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestMergeGateBlocksOnRequiredCheck: a pending required check refuses the merge
+// with 409 BEFORE easyvcs is asked.
+func TestMergeGateBlocksOnRequiredCheck(t *testing.T) {
+	cs, err := store.OpenDriver(store.DriverConfig{Kind: "sqlite", DSN: ":memory:"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vcs := server.New(cs, nil)
+	st := ci.NewMemStore()
+	_ = st.PutCheck(t.Context(), &ci.Check{
+		RR: 3, Namespace: "team-a", Name: "ci", State: ci.RunRunning, Required: true,
+	})
+	g, err := New(Config{VCS: vcs, CIStore: st, GateMerges: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/team-a/rr/3/merge", nil)
+	rec := httptest.NewRecorder()
+	g.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("merge = %d %s, want 409", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "required checks are pending") {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+// TestMergeGateAllowsWhenGreen: with the required check green the gate steps
+// aside (easyvcs then answers on its own — 401 for an unauthenticated caller).
+func TestMergeGateAllowsWhenGreen(t *testing.T) {
+	cs, err := store.OpenDriver(store.DriverConfig{Kind: "sqlite", DSN: ":memory:"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vcs := server.New(cs, nil)
+	st := ci.NewMemStore()
+	_ = st.PutCheck(t.Context(), &ci.Check{
+		RR: 3, Namespace: "team-a", Name: "ci", State: ci.RunSuccess, Required: true,
+	})
+	g, err := New(Config{VCS: vcs, CIStore: st, GateMerges: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/team-a/rr/3/merge", nil)
+	rec := httptest.NewRecorder()
+	g.ServeHTTP(rec, req)
+	if rec.Code == http.StatusConflict {
+		t.Fatalf("a green check must not be gated: %s", rec.Body.String())
+	}
+}
+
+// TestMergeGateCoordinates pins the path parsing.
+func TestMergeGateCoordinates(t *testing.T) {
+	cases := []struct {
+		path string
+		ns   string
+		rr   int64
+	}{
+		{"/api/v1/namespaces/team-a/rr/7/merge", "team-a", 7},
+		{"/api/v1/team-a/rr/7/merge", "", 0}, // platform shape, not easyvcs'
+		{"/api/v1/namespaces/a/rr/x/merge", "", 0},
+	}
+	for _, c := range cases {
+		ns, rr := mergeGateCoordinates(c.path)
+		if ns != c.ns || rr != c.rr {
+			t.Errorf("%s -> (%q,%d), want (%q,%d)", c.path, ns, rr, c.ns, c.rr)
+		}
+	}
+}
+
+// TestVCSRoutingIsClaimedBeforeCatchAll pins that the platform claims /ops and
 // /ci so easyvcs' git catch-all can never swallow them.
 func TestVCSRoutingIsClaimedBeforeCatchAll(t *testing.T) {
 	reg := ops.NewMemRegistry()
@@ -142,3 +293,9 @@ func jsonString(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
 }
+
+var errNotFoundStub = errNotFound("no workflow in this repo")
+
+type errNotFound string
+
+func (e errNotFound) Error() string { return string(e) }

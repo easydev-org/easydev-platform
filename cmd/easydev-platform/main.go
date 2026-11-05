@@ -4,14 +4,18 @@
 //
 // Flags/env (each component is optional; a missing one 503s its prefix):
 //
-//	--listen             :8080
-//	--vcs-db-driver      sqlite|postgres|mysql   (EASYVCS_DB_DRIVER)
-//	--vcs-db-dsn         ...                     (EASYVCS_DB_DSN)
-//	--vcs-data           ./data                  (sqlite dir + blobs)
-//	--vcs-admin-token    ...                     (EASYVCS_ADMIN_TOKEN)
-//	--blobs-url          http://easyblobs:8080   (empty = disabled)
-//	--ops-url            http://easyops:8080     (empty = disabled)
-//	--ci-ops             easyops|fake            (default fake when --ops-url empty)
+//	--listen             :8080                    (LISTEN)
+//	--vcs-db-driver      sqlite|postgres|mysql    (EASYVCS_DB_DRIVER)
+//	--vcs-db-dsn         ...                      (EASYVCS_DB_DSN)
+//	--vcs-data           ./data                   (EASYVCS_HOME)
+//	--vcs-admin-token    ...                      (EASYVCS_ADMIN_TOKEN)
+//	--vcs-url            http://easyvcs           (EASYDEV_VCS_URL: the URL
+//	                                               checkouts/actions fetch from;
+//	                                               defaults to this server)
+//	--blobs-url          http://easyblobs:8080    (EASYDEV_BLOBS_URL, '' = disabled)
+//	--ops-url            http://easyops:8080      (EASYDEV_OPS_URL, '' = disabled)
+//	--ci-ops             easyops|fake             (EASYDEV_CI_OPS)
+//	--gate-merges        true|false               (EASYDEV_GATE_MERGES)
 package main
 
 import (
@@ -22,6 +26,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -33,6 +38,7 @@ import (
 	"github.com/easydev-org/easydev-platform/internal/gateway"
 	"github.com/easydev-org/easydev-platform/internal/ops"
 	"github.com/easydev-org/easydev-platform/internal/tenant"
+	"github.com/easydev-org/easydev-platform/internal/wf"
 )
 
 func env(k, def string) string {
@@ -48,9 +54,13 @@ func main() {
 	dsn := flag.String("vcs-db-dsn", env("EASYVCS_DB_DSN", ""), "easyvcs db dsn")
 	data := flag.String("vcs-data", env("EASYVCS_HOME", "./data"), "easyvcs data dir (sqlite)")
 	admin := flag.String("vcs-admin-token", env("EASYVCS_ADMIN_TOKEN", ""), "easyvcs admin token")
-	blobsURL := flag.String("blobs-url", env("EASYDEB_BLOBS_URL", env("EASYDEV_BLOBS_URL", "")), "easyblobs base url ('' = disabled)")
+	vcsURL := flag.String("vcs-url", env("EASYDEV_VCS_URL", ""),
+		"easyvcs base URL used for checkouts/actions ('' = derive from the listen address)")
+	blobsURL := flag.String("blobs-url", env("EASYDEV_BLOBS_URL", ""), "easyblobs base url ('' = disabled)")
 	opsURL := flag.String("ops-url", env("EASYDEV_OPS_URL", ""), "easyops base url ('' = disabled)")
 	ciOps := flag.String("ci-ops", env("EASYDEV_CI_OPS", ""), "ci ops backend: easyops|fake")
+	gateMerges := flag.Bool("gate-merges", env("EASYDEV_GATE_MERGES", "true") == "true",
+		"refuse an RR merge while a required check is pending")
 	k8sNS := flag.String("k8s-namespace", env("EASYDEV_K8S_NAMESPACE", "easydev"),
 		"the ONE k8s namespace all tenants share (tenants are isolated by the platform's registry, not by k8s namespaces)")
 	flag.Parse()
@@ -76,11 +86,16 @@ func main() {
 		}
 	}
 	vcs := server.New(cs, nil)
-	// P2: let the platform decide identity. easyvcs keeps its default token path
+	// Let the platform decide identity. easyvcs keeps its default token path
 	// whenever the resolver declines (anonymous / unknown user), so the
 	// standalone behaviour is preserved.
 	ident := &tenant.Resolver{CS: cs}
 	vcs.WithIdentity(ident.Identity)
+
+	// Workflows/actions are read OUT of the VCS at pinned snapshots. Installing
+	// the source as the action resolver also makes `uses:` work inside a run.
+	wfSource := wf.New(cs)
+	ci.SetActionResolver(wfSource)
 
 	// Ops engine: the tenant-safe registry + (optionally) the real k8s backend
 	// from easyops' library packages. Tenants share ONE k8s namespace
@@ -88,8 +103,9 @@ func main() {
 	reg := ops.NewMemRegistry()
 	var jobRunner ops.JobRunner
 	if *ciOps != "fake" {
-		// NEWWithClientset needs a clientset; New() builds it from in-cluster
-		// config. A missing cluster is NOT fatal: we degrade to fake.
+		// jobmgr.New builds its clientset from the explicit easyops kubeconfig
+		// (or the in-cluster config). A missing cluster is NOT fatal: we degrade
+		// to the fake ops backend.
 		jm, jerr := jobmgr.New(jobmgr.Config{Namespace: *k8sNS})
 		if jerr != nil {
 			log.Printf("platform: k8s unavailable (%v); CI falls back to the fake ops backend", jerr)
@@ -100,13 +116,22 @@ func main() {
 	}
 	engine := ops.NewEngine(reg, jobRunner)
 
+	// Base URL the job's checkout prefix downloads from. When the platform
+	// embeds easyvcs, the checkout can also be served by this very process.
+	baseVCS := *vcsURL
+	if baseVCS == "" {
+		baseVCS = "http://127.0.0.1" + normalizeListen(*listen)
+		log.Printf("platform: EASYDEV_VCS_URL unset; checkouts will use %q (set EASYDEV_VCS_URL in a real deployment)", baseVCS)
+	}
+
 	// CI: an OpsClient. With a real backend it runs k8s Jobs; otherwise the fake.
 	var ciOpsClient ci.OpsClient
 	if jobRunner != nil {
-		// The tenant is per-RUN, so the adapter is created inside the orchestrator
-		// hook (see Orchestrator.WithOpsFactory). For the single-tenant default we
-		// bind it lazily per run.
-		ciOpsClient = ci.NewEngineOpsFactory(engine)
+		fac := ci.NewEngineOpsFactory(engine)
+		fac.VCSBase = baseVCS
+		fac.VCSUser = "admin"
+		fac.VCSToken = *admin
+		ciOpsClient = fac
 	} else {
 		ciOpsClient = ci.NewFakeOps()
 		log.Printf("platform: CI using the in-process fake ops backend")
@@ -115,12 +140,14 @@ func main() {
 	orch := ci.NewOrchestrator(ciStore, ciOpsClient)
 
 	gw, err := gateway.New(gateway.Config{
-		VCS:      vcs,
-		BlobsURL: *blobsURL,
-		OpsURL:   *opsURL,
-		CI:       orch,
-		CIStore:  ciStore,
-		Ops:      engine,
+		VCS:        vcs,
+		BlobsURL:   *blobsURL,
+		OpsURL:     *opsURL,
+		CI:         orch,
+		CIStore:    ciStore,
+		Ops:        engine,
+		Workflows:  wfSource,
+		GateMerges: *gateMerges,
 	})
 	if err != nil {
 		log.Fatalf("platform: gateway: %v", err)
@@ -132,7 +159,8 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {
-		log.Printf("easydev-platform listening on %s (vcs embedded; blobs=%q ops=%q)", *listen, *blobsURL, *opsURL)
+		log.Printf("easydev-platform listening on %s (vcs embedded; blobs=%q ops=%q ci-gate=%v)",
+			*listen, *blobsURL, *opsURL, *gateMerges)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("platform: serve: %v", err)
 		}
@@ -145,4 +173,13 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(ctx)
 	log.Printf("easydev-platform stopped")
+}
+
+// normalizeListen turns a listen address into a host:port suitable for a URL
+// (":8080" -> ":8080", "0.0.0.0:8080" -> ":8080").
+func normalizeListen(addr string) string {
+	if strings.HasPrefix(addr, "0.0.0.0") {
+		return strings.TrimPrefix(addr, "0.0.0.0")
+	}
+	return addr
 }
