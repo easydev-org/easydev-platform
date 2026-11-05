@@ -103,6 +103,15 @@ type Run struct {
 	// Group is the resolved concurrency group this run belongs to ("" = none).
 	// Persisted so the gate is truthful across replicas.
 	Group string `json:"group,omitempty"`
+	// secrets/secretRefs/secretCtx are resolved once per run (not persisted: a
+	// value must never be written to the store).
+	secrets    map[string]string `json:"-"`
+	secretRefs []SecretEnvVar    `json:"-"`
+	secretCtx  map[string]any    `json:"-"`
+	secretsErr error             `json:"-"`
+	// secretOwned records that this run created the per-run Secret and must
+	// delete it when the run ends.
+	secretOwned bool `json:"-"`
 }
 
 // Check is a merge-blocking status shown on a Revision Request. One check per

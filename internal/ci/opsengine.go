@@ -99,6 +99,7 @@ func (o *EngineOps) RunJob(ctx context.Context, spec JobSpec) (string, error) {
 		Owner:          spec.Owner,
 		Services:       toOpsServices(spec.Services),
 		Workspace:      spec.Workspace,
+		SecretEnv:      toOpsSecretEnv(spec.SecretEnv),
 	})
 	if err != nil {
 		return "", err
@@ -260,4 +261,39 @@ func shellQuote(s string) string {
 		return "''"
 	}
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// WatchLogs streams the job's log by polling the tail and emitting only the new
+// bytes. easyops' library path has no watch for job logs, so this is the
+// best available without the network API.
+//
+// It is safe to lose the beginning: the tail grows, and only the delta since the
+// last emission is sent.
+func (o *EngineOps) WatchLogs(ctx context.Context, jobID string, emit func(string)) error {
+	var emitted int
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		logs, err := o.Logs(ctx, jobID)
+		if err == nil && len(logs) > emitted {
+			emit(logs[emitted:])
+			emitted = len(logs)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func toOpsSecretEnv(in []SecretEnvVar) []ops.SecretEnvVar {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]ops.SecretEnvVar, 0, len(in))
+	for _, s := range in {
+		out = append(out, ops.SecretEnvVar{Env: s.Env, Secret: s.Secret, Key: s.Key})
+	}
+	return out
 }

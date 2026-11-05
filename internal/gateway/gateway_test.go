@@ -299,3 +299,47 @@ var errNotFoundStub = errNotFound("no workflow in this repo")
 type errNotFound string
 
 func (e errNotFound) Error() string { return string(e) }
+
+// TestCILogStreamDeliversChunksAndEnds: the live-log endpoint streams chunks and
+// closes once the run is terminal, so a client can read to EOF.
+func TestCILogStreamDeliversChunksAndEnds(t *testing.T) {
+	st := ci.NewMemStore()
+	orch := ci.NewOrchestrator(st, ci.NewFakeOps())
+	g, err := New(Config{CI: orch, CIStore: st})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A terminal run with a recorded tail.
+	_ = st.PutRun(t.Context(), &ci.Run{
+		ID: "run-logs", Namespace: "team-a", State: ci.RunSuccess,
+		Jobs: []ci.JobResult{{Key: "build", State: ci.RunSuccess, LogsTail: "tail-before-subscribe\n"}},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/team-a/ci/runs/run-logs/logs/build", nil)
+	rec := httptest.NewRecorder()
+	g.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d %s", rec.Code, rec.Body.String())
+	}
+	// The already-captured tail must be sent first, so a late subscriber is not
+	// blind; the handler then returns because the run is terminal.
+	if !strings.Contains(rec.Body.String(), "tail-before-subscribe") {
+		t.Errorf("body = %q", rec.Body.String())
+	}
+}
+
+// TestCILogStreamIsTenantScoped: another tenant cannot read it.
+func TestCILogStreamIsTenantScoped(t *testing.T) {
+	st := ci.NewMemStore()
+	orch := ci.NewOrchestrator(st, ci.NewFakeOps())
+	g, _ := New(Config{CI: orch, CIStore: st})
+	_ = st.PutRun(t.Context(), &ci.Run{ID: "run-x", Namespace: "team-a", State: ci.RunSuccess})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/team-b/ci/runs/run-x/logs/build", nil)
+	rec := httptest.NewRecorder()
+	g.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("cross-tenant log stream = %d, want 404", rec.Code)
+	}
+}

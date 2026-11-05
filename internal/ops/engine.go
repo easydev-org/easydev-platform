@@ -62,6 +62,16 @@ type JobSpec struct {
 	Services map[string]ServiceSpec
 	// Workspace is a PVC claim mounted at /workspace ("" = ephemeral emptyDir).
 	Workspace string
+	// SecretEnv injects credentials as REFERENCES to an existing Secret, so a
+	// value never travels through this struct.
+	SecretEnv []SecretEnvVar
+}
+
+// SecretEnvVar binds one environment variable to a key of a Secret.
+type SecretEnvVar struct {
+	Env    string
+	Secret string
+	Key    string
 }
 
 // SubmitJob creates the k8s Job for a tenant. It:
@@ -197,4 +207,15 @@ func (e *Engine) DeleteJob(ctx context.Context, tenant, name string) error {
 		}
 	}
 	return e.Reg.Delete(ctx, tenant, KindJob, name)
+}
+
+func toJobmgrSecretEnv(in []SecretEnvVar) []jobmgr.SecretEnvVar {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]jobmgr.SecretEnvVar, 0, len(in))
+	for _, s := range in {
+		out = append(out, jobmgr.SecretEnvVar{Env: s.Env, Secret: s.Secret, Key: s.Key})
+	}
+	return out
 }

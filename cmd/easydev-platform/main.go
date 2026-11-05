@@ -33,6 +33,9 @@ import (
 	"github.com/easylab-platform/easyvcs/server"
 
 	"github.com/easy-platform/easyops/k8s/jobmgr"
+	"github.com/easy-platform/easyops/k8s/k8sconfig"
+	"github.com/easy-platform/easyops/k8s/servicesmgr"
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/easydev-org/easydev-platform/internal/ci"
 	"github.com/easydev-org/easydev-platform/internal/gateway"
@@ -114,6 +117,19 @@ func main() {
 			log.Printf("platform: CI using REAL k8s Jobs in namespace %q (tenants isolated by the registry)", *k8sNS)
 		}
 	}
+	// The secrets backend shares the same k8s config as the job runner.
+	var secretsSvc *ops.SecretsService
+	if cfg, cerr := k8sconfig.RESTConfig(); cerr == nil {
+		if cs, serr := kubernetes.NewForConfig(cfg); serr == nil {
+			secretsSvc = &ops.SecretsService{
+				Client: servicesmgr.NewWithClientset(cs, servicesmgr.Config{Namespace: *k8sNS}),
+			}
+		} else {
+			log.Printf("platform: secrets backend unavailable: %v", serr)
+		}
+	} else {
+		log.Printf("platform: secrets backend unavailable: %v", cerr)
+	}
 	engine := ops.NewEngine(reg, jobRunner)
 
 	// Base URL the job's checkout prefix downloads from. When the platform
@@ -161,6 +177,18 @@ func main() {
 	orch := ci.NewOrchestrator(ciStore, ciOpsClient).
 		WithConcurrency(ci.NewConcurrencyGate(ciStore)).
 		WithVCS(baseVCS, "admin", *admin)
+	if secretsSvc != nil {
+		// `${{ secrets.X }}` becomes a REFERENCE into a per-run Secret, so a
+		// value never enters the job spec or a log.
+		orch.WithSecrets(secretsSvc, secretsSvc)
+	}
+	// `permissions:` mints a scoped token from the VCS store. The platform's
+	// admin user owns the CI tokens (a run's job is the platform acting for the
+	// tenant, and the reverse — a tenant token — is what the GATEWAY injects for
+	// tenant-initiated actions).
+	if adminUser, uerr := cs.GetUserByUsername("admin"); uerr == nil && adminUser != nil {
+		orch.WithTokenMinter(&ops.VCSTokenMinter{CS: cs, UserID: adminUser.ID})
+	}
 	orch.WithLogCap(8192)
 
 	gw, err := gateway.New(gateway.Config{
