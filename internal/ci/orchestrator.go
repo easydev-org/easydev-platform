@@ -100,9 +100,24 @@ type Orchestrator struct {
 	logCap int
 	// gate enforces `concurrency:` when the workflow declares it (nil = off).
 	gate *ConcurrencyGate
-	// mu guards seq (run-id uniqueness within one process).
+	// mu guards seq/execSeq (id uniqueness within one process).
 	mu  sync.Mutex
 	seq uint64
+	// execSeq numbers executor jobs so their names are unique even after
+	// sanitize's 60-char truncation.
+	execSeq uint64
+	// vcsBase/vcsUser/vcsToken let the supervisor script fetch the checkout.
+	// They are set by WithVCS.
+	vcsBase  string
+	vcsUser  string
+	vcsToken string
+}
+
+// WithVCS configures how the in-container supervisor fetches the source tree.
+// Empty base means "no checkout" (a job that does not need the repo).
+func (o *Orchestrator) WithVCS(base, user, token string) *Orchestrator {
+	o.vcsBase, o.vcsUser, o.vcsToken = base, user, token
+	return o
 }
 
 // WithConcurrency enables `concurrency:` enforcement.
@@ -297,181 +312,6 @@ type instanceResult struct {
 
 // runInstance executes one job instance: resolve `if:`, run its steps in order,
 // and stop at the first failing step (unless it is continue-on-error).
-func (o *Orchestrator) runInstance(ctx context.Context, run *Run, inst *Instance, wf *Workflow, results map[string]*JobResult, ops OpsClient) instanceResult {
-	j := inst.Job
-	vars := o.baseVars(run, inst, wf, results)
-	xctx := &expr.Ctx{Vars: vars, Status: expr.StatusSuccess}
-
-	// `if:` on the job.
-	if j.If != "" {
-		ok, err := expr.EvalBool(j.If, xctx)
-		if err != nil {
-			return instanceResult{state: RunFailed, err: "if: " + err.Error()}
-		}
-		if !ok {
-			return instanceResult{state: RunSkipped}
-		}
-	}
-
-	out := instanceResult{state: RunRunning}
-	// stepsCtx accumulates `steps.<id>.outputs.<k>` as steps finish, so a job's
-	// declared `outputs:` can be resolved at the end.
-	stepsCtx := map[string]any{}
-	vars["steps"] = stepsCtx
-
-	for i := range j.Steps {
-		st := &j.Steps[i]
-		if o.canceled(ctx, run.ID) {
-			out.state = RunCanceled
-			return out
-		}
-		sctx := &expr.Ctx{Vars: vars, Status: expr.StatusSuccess}
-		if st.If != "" {
-			ok, err := expr.EvalBool(st.If, sctx)
-			if err != nil {
-				out.steps = append(out.steps, StepResult{ID: st.ID, Name: st.Name, State: RunFailed, Error: "if: " + err.Error()})
-				if !st.ContinueOnError {
-					out.state, out.exit = RunFailed, 1
-					return out
-				}
-				out.steps = append(out.steps, StepResult{ID: st.ID, Name: st.Name, State: RunSkipped})
-				continue
-			}
-			if !ok {
-				out.steps = append(out.steps, StepResult{ID: st.ID, Name: st.Name, State: RunSkipped})
-				continue
-			}
-		}
-
-		sr, logTail := o.runStep(ctx, run, inst, st, vars, xctx, ops)
-		out.steps = append(out.steps, sr)
-		if sr.ID != "" {
-			stepsCtx[sr.ID] = map[string]any{
-				"outputs": toAnyMapStrings(sr.Outputs),
-				"outcome": string(sr.State),
-			}
-		}
-		if logTail != "" {
-			out.tail = joinTail(out.tail, logTail, o.logCap)
-		}
-		if sr.State == RunFailed {
-			if st.ContinueOnError {
-				xctx.Status = expr.StatusFailure
-				continue
-			}
-			out.state, out.exit = RunFailed, sr.ExitCode
-			if out.exit == 0 {
-				out.exit = 1
-			}
-			return out
-		}
-		// A step that failed but continued taints success() for later steps.
-		if sr.State != RunSuccess {
-			xctx.Status = expr.StatusFailure
-		}
-	}
-	out.state = RunSuccess
-	// Resolve the job's declared outputs (`jobs.<id>.outputs`).
-	if len(j.Outputs) > 0 {
-		octx := &expr.Ctx{Vars: vars, Status: expr.StatusSuccess}
-		out.outputs = map[string]string{}
-		for name, tmpl := range j.Outputs {
-			s, err := expr.Interpolate(tmpl, octx)
-			if err != nil {
-				continue // a bad output expression must not fail a green job
-			}
-			out.outputs[name] = s
-		}
-	}
-	return out
-}
-
-// runStep runs ONE step. A `uses:` action is resolved to its shell/composite
-// form by the caller-provided ActionResolver (see actions.go); a `run:` step is
-// a shell script. Both end up as commands on the executor.
-func (o *Orchestrator) runStep(ctx context.Context, run *Run, inst *Instance, st *Step, vars map[string]any, xctx *expr.Ctx, ops OpsClient) (StepResult, string) {
-	res := StepResult{ID: st.ID, Name: st.Name}
-
-	// Interpolate the environment and the script. Everything a workflow can
-	// inject into the shell goes through ENV or is shell-quoted; interpolated
-	// values are NEVER concatenated raw into `run:` (that would be an
-	// injection vector).
-	env, err := interpolateMap(mergeEnv(inst.Job.Env, st.Env), xctx)
-	if err != nil {
-		res.State, res.Error = RunFailed, err.Error()
-		return res, ""
-	}
-
-	var script string
-	if st.Uses != "" {
-		// The action's definition is a shell script (or a composite of steps)
-		// resolved from the VCS and pinned by ref — see actions.go.
-		a, aerr := ResolveAction(st.Uses, inst.Job, st)
-		if aerr != nil {
-			res.State, res.Error = RunFailed, aerr.Error()
-			return res, ""
-		}
-		script = a.Script
-		for k, v := range a.Env {
-			env[k] = v
-		}
-	} else {
-		s, ierr := expr.Interpolate(st.Run, xctx)
-		if ierr != nil {
-			res.State, res.Error = RunFailed, ierr.Error()
-			return res, ""
-		}
-		script = s
-	}
-
-	shell := st.Shell
-	if shell == "" {
-		shell = "bash"
-	}
-	workdir := st.WorkingDirectory
-
-	spec := JobSpec{
-		Name:           sanitize(fmt.Sprintf("%s-%s-%s-%d", run.ID, inst.Key, run.Head, len(res.ID))),
-		Namespace:      run.Namespace,
-		Owner:          run.Owner,
-		Image:          imageFor(inst.Job),
-		Commands:       []string{script},
-		Env:            env,
-		Shell:          shell,
-		WorkDir:        workdir,
-		CPU:            "",
-		Memory:         "",
-		TimeoutSeconds: stepTimeout(inst.Job, st),
-		Checkout:       checkoutSpec(run),
-		// Every step is one container (or one script) — the executor decides.
-		Services: serviceSpecs(inst.Job),
-	}
-
-	jobID, err := ops.RunJob(ctx, spec)
-	if err != nil {
-		res.State, res.Error = RunFailed, err.Error()
-		return res, ""
-	}
-	code, werr := ops.WaitJob(ctx, jobID)
-	logs, _ := ops.Logs(ctx, jobID)
-	_ = ops.DeleteJob(ctx, jobID)
-
-	res.ExitCode = code
-	switch {
-	case werr != nil && strings.Contains(werr.Error(), "cancel"):
-		res.State = RunCanceled
-	case code == 0:
-		res.State = RunSuccess
-	default:
-		res.State = RunFailed
-		if werr != nil {
-			res.Error = werr.Error()
-		}
-	}
-	res.Outputs = parseOutputs(spec.Name, logs)
-	return res, logs
-}
-
 // newRunID builds a unique run id.
 //
 // The timestamp is not enough on its own: two runs created in the same
