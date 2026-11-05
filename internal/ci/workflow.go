@@ -124,6 +124,11 @@ type WorkflowJob struct {
 	// Outputs maps an output name to an expression over steps.*.outputs.
 	Outputs map[string]string
 
+	// Artifacts are glob paths (relative to /workspace) uploaded to the package
+	// registry after the job succeeds, so a later job or a human can fetch them.
+	// A pattern ending in "/" is archived as a directory.
+	Artifacts []string
+
 	// Required marks a job whose failure BLOCKS a merge (a required check).
 	Required bool
 	// TimeoutMinutes bounds the whole job (0 = no deadline).

@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/easylab-platform/easyvcs/server"
 	"github.com/easylab-platform/easyvcs/store"
@@ -341,5 +343,101 @@ func TestCILogStreamIsTenantScoped(t *testing.T) {
 	g.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("cross-tenant log stream = %d, want 404", rec.Code)
+	}
+}
+
+// TestWebhookStartsARunFromASignedEvent is the end-to-end trigger: a signed
+// easyvcs event starts a run without any manual POST /ci/events.
+func TestWebhookStartsARunFromASignedEvent(t *testing.T) {
+	st := ci.NewMemStore()
+	orch := ci.NewOrchestrator(st, ci.NewFakeOps())
+	wf := mustWorkflow(t, "version: 1\non: [rr_opened]\njobs:\n  t:\n    container: {image: busybox}\n    steps: [{run: 'true'}]\n")
+	g, err := New(Config{
+		CI: orch, CIStore: st, Workflows: &fakeWorkflows{wf: wf},
+		WebhookSecret: "s3cret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(server.WebhookEvent{
+		Event: "rr.opened", Namespace: "team-a", RR: 3, Base: "base-sha", Head: "head-sha",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/team-a/ci/hooks", strings.NewReader(string(body)))
+	ts := time.Now().Unix()
+	req.Header.Set("X-EasyVCS-Timestamp", strconv.FormatInt(ts, 10))
+	req.Header.Set("X-EasyVCS-Signature", server.SignWebhook("s3cret", ts, body))
+	rec := httptest.NewRecorder()
+	g.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("webhook = %d %s", rec.Code, rec.Body.String())
+	}
+	runs, _ := st.ListRuns(t.Context(), "team-a", 10)
+	if len(runs) != 1 {
+		t.Fatalf("runs = %d", len(runs))
+	}
+	if runs[0].RR != 3 || runs[0].Head != "head-sha" || runs[0].Base != "base-sha" {
+		t.Errorf("run = %+v", runs[0])
+	}
+}
+
+// TestWebhookRejectsABadSignature: an unsigned or tampered request must not be
+// interpreted at all.
+func TestWebhookRejectsABadSignature(t *testing.T) {
+	st := ci.NewMemStore()
+	orch := ci.NewOrchestrator(st, ci.NewFakeOps())
+	wf := mustWorkflow(t, "version: 1\non: [rr_opened]\njobs:\n  t:\n    container: {image: busybox}\n    steps: [{run: 'true'}]\n")
+	g, _ := New(Config{CI: orch, CIStore: st, Workflows: &fakeWorkflows{wf: wf}, WebhookSecret: "s3cret"})
+
+	body := `{"event":"rr.opened","namespace":"team-a"}`
+	for name, mutate := range map[string]func(*http.Request){
+		"no timestamp": func(r *http.Request) {},
+		"bad signature": func(r *http.Request) {
+			r.Header.Set("X-EasyVCS-Timestamp", strconv.FormatInt(time.Now().Unix(), 10))
+			r.Header.Set("X-EasyVCS-Signature", "sha256=deadbeef")
+		},
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/team-a/ci/hooks", strings.NewReader(body))
+		mutate(req)
+		rec := httptest.NewRecorder()
+		g.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("%s: status = %d, want 401", name, rec.Code)
+		}
+	}
+	if runs, _ := st.ListRuns(t.Context(), "team-a", 10); len(runs) != 0 {
+		t.Errorf("a rejected webhook started %d run(s)", len(runs))
+	}
+}
+
+// TestWebhookRejectsACrossTenantBody.
+func TestWebhookRejectsACrossTenantBody(t *testing.T) {
+	st := ci.NewMemStore()
+	orch := ci.NewOrchestrator(st, ci.NewFakeOps())
+	wf := mustWorkflow(t, "version: 1\non: [rr_opened]\njobs:\n  t:\n    container: {image: busybox}\n    steps: [{run: 'true'}]\n")
+	g, _ := New(Config{CI: orch, CIStore: st, Workflows: &fakeWorkflows{wf: wf}})
+
+	body := `{"event":"rr.opened","namespace":"team-b"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/team-a/ci/hooks", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	g.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("cross-tenant webhook = %d, want 403", rec.Code)
+	}
+}
+
+// TestWebhookIgnoresUnknownEvents: a sender may publish more than we act on.
+func TestWebhookIgnoresUnknownEvents(t *testing.T) {
+	st := ci.NewMemStore()
+	orch := ci.NewOrchestrator(st, ci.NewFakeOps())
+	wf := mustWorkflow(t, "version: 1\non: [rr_opened]\njobs:\n  t:\n    container: {image: busybox}\n    steps: [{run: 'true'}]\n")
+	g, _ := New(Config{CI: orch, CIStore: st, Workflows: &fakeWorkflows{wf: wf}})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/team-a/ci/hooks",
+		strings.NewReader(`{"event":"branch.deleted","namespace":"team-a"}`))
+	rec := httptest.NewRecorder()
+	g.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "ignored") {
+		t.Fatalf("unknown event = %d %s", rec.Code, rec.Body.String())
 	}
 }

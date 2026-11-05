@@ -89,7 +89,18 @@ func (o *Orchestrator) runInstance(ctx context.Context, run *Run, inst *Instance
 		})
 	}
 
-	script := supervisorScript(plan, checkoutSpec(run), o.vcsUser, o.vcsToken, o.vcsBase, run.Namespace)
+	// Artifacts are declared per job and uploaded from INSIDE the container, so a
+	// build product never travels through the control plane.
+	targets, aerr := resolveArtifacts(j.Artifacts)
+	if aerr != nil {
+		return instanceResult{state: RunFailed, err: aerr.Error()}
+	}
+	artScript := ""
+	if len(targets) > 0 && o.artifactBase() != "" {
+		artScript = artifactScript(j, run, inst, targets)
+	}
+
+	script := supervisorScript(plan, checkoutSpec(run), o.vcsUser, o.vcsToken, o.vcsBase, run.Namespace, artScript)
 
 	spec := JobSpec{
 		// ONE executor job per instance. The name carries the instance key and a
@@ -100,10 +111,12 @@ func (o *Orchestrator) runInstance(ctx context.Context, run *Run, inst *Instance
 		Owner:     run.Owner,
 		Image:     imageFor(inst.Job),
 		Commands:  []string{script},
+		// The artifact uploader reads these at run time; the TOKEN comes from the
+		// secret refs, never from here.
+		Env: withArtifactEnv(baseEnv, o.artifactBase(), artifactPath(run, inst), len(targets) > 0),
 		// Secrets are NEVER in Env: only refs, so the value cannot leak into the
 		// spec. (The orchestrator keeps `secretEnv` solely to create the per-run
 		// Secret the reference points at.)
-		Env:            baseEnv,
 		SecretEnv:      secretRefs,
 		Shell:          "bash",
 		TimeoutSeconds: jobTimeoutSeconds(inst.Job),

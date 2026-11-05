@@ -333,7 +333,56 @@ permissions:
   chunks as the job produces them and closes when the run is terminal. Without
   it, a long step was silent until it finished.
 
-## 9. Deliberate non-goals
+## 9. Artifacts
+
+```yaml
+jobs:
+  build:
+    artifacts: ["bin/*", "coverage/"]
+    steps:
+      - run: make build
+```
+
+The upload happens **inside the container**, at the end of the supervisor script,
+as `tar czf - <pattern> | curl -X PUT` to the package registry's `generic`
+protocol:
+
+- no new RPC on easyops (an artifact is a package, and the registry stores
+  packages);
+- no file bytes cross the orchestrator — a 500 MB binary never touches the
+  control plane or the store;
+- the credential is the same `permissions: packages: write` token, resolved as a
+  Secret reference.
+
+Patterns are confined to `/workspace` (an absolute path or `..` is rejected, so a
+workflow cannot exfiltrate the image's own files), a pattern ending in `/` or `/*`
+is archived as a directory, and a failed upload is reported but does **not** fail
+an otherwise green job.
+
+## 10. Webhooks
+
+easyvcs emits HMAC-signed events; the platform receives them at
+`POST /api/v1/{ns}/ci/hooks`.
+
+| Event | Trigger |
+|---|---|
+| `rr.opened` | a Revision Request was created |
+| `rr.synced` | its source snapshot was updated |
+| `rr.merged` | it landed on the target branch |
+| `tag.created` | a tag was created |
+
+- The signature is HMAC-SHA256 over `<timestamp>.<body>`, sent as
+  `X-EasyVCS-Signature: sha256=<hex>` plus `X-EasyVCS-Timestamp`. A receiver
+  rejects anything older than 5 minutes (replay) and compares in constant time.
+- Delivery is **asynchronous and best effort**: a slow or broken receiver never
+  blocks or fails a VCS write.
+- The tenant comes from the URL and must match the payload — a body naming
+  another tenant is a forgery, not a routing hint.
+- In a single-binary deployment the sink calls the handler **in process**
+  (`gateway.InProcessSink`), so there is no self-POST and no "the platform cannot
+  reach its own URL" failure mode. A split deployment sets `EASYDEV_WEBHOOK_URL`.
+
+## 11. Deliberate non-goals
 
 | Not doing | Why |
 |---|---|
@@ -366,6 +415,8 @@ Implemented and covered by tests (`internal/ci`, `internal/wf`,
 | live log streaming (`GET .../runs/{id}/logs/{instance}`) | done |
 | `secrets:` as Secret REFERENCES (value never in the spec) | done |
 | `permissions:` enforced as a scoped, short-lived token | done |
+| `artifacts:` uploaded from inside the container to the registry | done |
+| easyvcs webhook triggers (signed, HMAC) | done |
 | `Untrusted` job hardening (no SA token, non-root, RO rootfs, no caps) | done |
 | end-to-end test: VCS snapshot → workflow → run → check | done |
 

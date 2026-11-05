@@ -29,6 +29,9 @@ func (g *Gateway) handleCITenant(w http.ResponseWriter, r *http.Request, tenant,
 		return
 	}
 	switch {
+	case tail == "hooks":
+		g.ciWebhook(w, r, tenant)
+
 	case tail == "events" && r.Method == http.MethodPost:
 		g.ciTrigger(w, r, tenant)
 
