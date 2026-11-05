@@ -265,12 +265,33 @@ about CI.
 
 ## 8. Status / roadmap
 
-Implemented: parsing (incl. the v1 shape), matrix + include/exclude, `if:`
-gating, `needs` + `outputs`, expression engine, action resolver (shell +
-composite), per-step execution with checkout, step outputs, checks, merge gate,
-cancel/re-run, tenant isolation, `Untrusted` job hardening.
+Implemented and covered by tests (`internal/ci`, `internal/wf`,
+`internal/platformtest`):
 
-Next: Postgres `ci.Store` (today `MemStore`), log archival to easyblobs, cache
-PVCs keyed by `(tenant, lockfile hash)`, `concurrency` enforcement across
-replicas, and an easyvcs `AuditSink`/webhook so events arrive without a manual
-POST.
+| Area | State |
+|---|---|
+| parsing, v1 compatibility, matrix (include/exclude), `if:`, `needs`, outputs | done |
+| expression language (`internal/ci/expr`) | done |
+| `uses:` resolution to a subtree at a pinned ref; shell + composite actions | done |
+| per-step execution with a pinned-snapshot checkout | done |
+| step → job output propagation (`$EASYDEV_OUTPUT` marker) | done |
+| checks + merge gate (409 before easyvcs sees the merge) | done |
+| cancel, re-run (re-pinned), workflow listing | done |
+| durable state (`ci.SQLStore`: sqlite/pg/mysql, pure-Go driver) | done |
+| `concurrency:` group + cancel-in-progress (cross-replica) | done |
+| `Untrusted` job hardening (no SA token, non-root, RO rootfs, no caps) | done |
+| end-to-end test: VCS snapshot → workflow → run → check | done |
+
+Next:
+
+1. **Log archival to easyblobs** — the full step log is currently truncated to
+   the inline tail; the `LogSHA` field is reserved for it.
+2. **Cache PVCs** keyed by `(tenant, lockfile hash)` — `CreateJob` already accepts
+   a workspace claim, so this is wiring.
+3. **Event source** — an easyvcs `AuditSink` (the `rr-merge` / `commit` events
+   are already recorded there) or a signed webhook, so runs start without a
+   manual `POST /ci/events`.
+4. **Tekton-style multi-container steps** — one container per step inside one
+   Pod, for per-step images without a Job each.
+5. **Optional self-hosted runner** — a fourth `OpsClient`, for execution outside
+   the cluster.
