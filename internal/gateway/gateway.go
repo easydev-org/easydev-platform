@@ -50,6 +50,9 @@ type Config struct {
 	// RequireCI gate: when true (the default for a multi-tenant deployment), an
 	// RR merge is refused while a required check is pending.
 	GateMerges bool
+	// WebhookSecret verifies easyvcs' HMAC. Empty accepts unsigned delivery
+	// (only acceptable when the receiver is not reachable from outside).
+	WebhookSecret string
 }
 
 // WorkflowSource resolves workflow + action files from the VCS. It is

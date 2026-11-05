@@ -118,6 +118,8 @@ type Orchestrator struct {
 	// onLog, when set, observes every forwarded log chunk (tests, and a future
 	// websocket fan-out). Normal subscribers go through SubscribeLogs.
 	onLog func(runID, instanceKey, chunk string)
+	// artifactsBase is the package-registry base URL; empty disables `artifacts:`.
+	artifactsBase string
 	// tokens mints the scoped credential `permissions:` grants. nil = a workflow
 	// that requests access fails at plan time.
 	tokens TokenMinter

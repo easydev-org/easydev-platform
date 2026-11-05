@@ -64,6 +64,10 @@ func main() {
 	ciOps := flag.String("ci-ops", env("EASYDEV_CI_OPS", ""), "ci ops backend: easyops|fake")
 	gateMerges := flag.Bool("gate-merges", env("EASYDEV_GATE_MERGES", "true") == "true",
 		"refuse an RR merge while a required check is pending")
+	webhookURL := flag.String("webhook-url", env("EASYDEV_WEBHOOK_URL", ""),
+		"easyvcs delivers change events here ('' = no webhooks)")
+	webhookSecret := flag.String("webhook-secret", env("EASYDEV_WEBHOOK_SECRET", ""),
+		"HMAC secret for webhook delivery/verification ('' = unsigned)")
 	k8sNS := flag.String("k8s-namespace", env("EASYDEV_K8S_NAMESPACE", "easydev"),
 		"the ONE k8s namespace all tenants share (tenants are isolated by the platform's registry, not by k8s namespaces)")
 	flag.Parse()
@@ -89,6 +93,16 @@ func main() {
 		}
 	}
 	vcs := server.New(cs, nil)
+	// Webhooks: easyvcs EMITS the change events (rr.opened/synced/merged,
+	// tag.created) and the platform RECEIVES them at /api/v1/{ns}/ci/hooks.
+	// In a single-binary deployment the sink posts to this very process; a split
+	// deployment sets EASYDEV_WEBHOOK_URL to the platform's address.
+	if u := *webhookURL; u != "" {
+		vcs.WithWebhook(server.NewWebhookSink(server.WebhookConfig{
+			URL: u, Secret: *webhookSecret,
+		}))
+		log.Printf("platform: easyvcs webhooks -> %s", u)
+	}
 	// Let the platform decide identity. easyvcs keeps its default token path
 	// whenever the resolver declines (anonymous / unknown user), so the
 	// standalone behaviour is preserved.
@@ -192,17 +206,26 @@ func main() {
 	orch.WithLogCap(8192)
 
 	gw, err := gateway.New(gateway.Config{
-		VCS:        vcs,
-		BlobsURL:   *blobsURL,
-		OpsURL:     *opsURL,
-		CI:         orch,
-		CIStore:    ciStore,
-		Ops:        engine,
-		Workflows:  wfSource,
-		GateMerges: *gateMerges,
+		VCS:           vcs,
+		BlobsURL:      *blobsURL,
+		OpsURL:        *opsURL,
+		CI:            orch,
+		CIStore:       ciStore,
+		Ops:           engine,
+		Workflows:     wfSource,
+		GateMerges:    *gateMerges,
+		WebhookSecret: *webhookSecret,
 	})
 	if err != nil {
 		log.Fatalf("platform: gateway: %v", err)
+	}
+
+	// Single-binary mode: deliver events IN PROCESS, so a deployment without a
+	// reachable self-URL still gets CI triggers. (An explicit --webhook-url keeps
+	// the networked path for a split deployment.)
+	if *webhookURL == "" {
+		vcs.WithWebhook(&gateway.InProcessSink{Handler: gw, Secret: *webhookSecret})
+		log.Printf("platform: easyvcs webhooks -> in-process handler")
 	}
 
 	srv := &http.Server{

@@ -53,7 +53,7 @@ type stepPlan struct {
 //
 // The script is deterministic given the plan, so a re-run of the same snapshot
 // produces the same bytes.
-func supervisorScript(plan []stepPlan, checkout *CheckoutSpec, vcsUser, vcsToken, vcsBase, ns string) string {
+func supervisorScript(plan []stepPlan, checkout *CheckoutSpec, vcsUser, vcsToken, vcsBase, ns, artifacts string) string {
 	var b strings.Builder
 	b.WriteString("set -u\n")
 	b.WriteString("mkdir -p /workspace/.easydev/out\n")
@@ -78,6 +78,13 @@ FIRST_FAIL_CODE=0
 `)
 	for _, sp := range plan {
 		writeStep(&b, sp)
+	}
+
+	// Artifacts upload BEFORE the result block: the summary must be the last
+	// thing in the log, or a truncated tail would lose it. A failed upload never
+	// fails an otherwise green job (see artifactScript).
+	if artifacts != "" {
+		b.WriteString(artifacts)
 	}
 
 	// The result block is the LAST thing written, so a log truncated to its tail

@@ -405,6 +405,8 @@ func buildJob(id string, rj *rawJob) (*WorkflowJob, error) {
 			}
 		}
 	}
+	// v1 put `artifacts:` on the job; v2 allows it per job as well.
+	j.Artifacts = rj.Artifacts
 	if rj.Strategy != nil {
 		ff := true
 		if rj.Strategy.FailFast != nil {
