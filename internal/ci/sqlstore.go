@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/glebarez/sqlite" // pure Go: no cgo, like easyvcs' own driver
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -90,6 +90,8 @@ func OpenStore(driver, dsn string) (*SQLStore, error) {
 	var dial gorm.Dialector
 	switch driver {
 	case "sqlite", "sqlite3":
+		// glebarez/sqlite is the pure-Go driver (modernc), so the platform keeps
+		// building with CGO_ENABLED=0 — the same constraint easyvcs lives under.
 		dial = sqlite.Open(dsn)
 	case "postgres", "postgresql":
 		dial = postgres.Open(dsn)
