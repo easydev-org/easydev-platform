@@ -51,6 +51,27 @@ func TestMaterialiseSubPathCheckout(t *testing.T) {
 	}
 }
 
+// TestMaterialiseCheckoutPrecedesWorkdir pins the ordering: the working
+// directory is usually a subdirectory OF the checkout, so the tree must land
+// first.
+func TestMaterialiseCheckoutPrecedesWorkdir(t *testing.T) {
+	o := &EngineOps{VCSBase: "http://vcs.local"}
+	script, _ := o.materialise(JobSpec{
+		Namespace: "team-a",
+		Commands:  []string{"make"},
+		Checkout:  &CheckoutSpec{Ref: "sha"},
+		WorkDir:   "services/api",
+	})
+	ci := strings.Index(script, "tar -xz")
+	wd := strings.Index(script, "services/api")
+	if ci < 0 || wd < 0 {
+		t.Fatalf("script missing checkout or workdir:\n%s", script)
+	}
+	if ci > wd {
+		t.Fatalf("the checkout must happen BEFORE cd into the workdir:\n%s", script)
+	}
+}
+
 // TestMaterialiseNoCheckout: a job without a checkout must not fetch anything
 // (e.g. a step that only calls an API).
 func TestMaterialiseNoCheckout(t *testing.T) {
